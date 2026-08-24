@@ -3,6 +3,7 @@
 BeeLlama v0.4.4 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
+This tree is merged through upstream llama.cpp b10599 (`4a08fa297`).
 
 ## KVarN target KV cache
 

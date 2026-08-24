@@ -14,9 +14,21 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $env:MSBUILDDISABLENODEREUSE = "1"
 
+$vsInstaller = "C:\Program Files (x86)\Microsoft Visual Studio\Installer"
+$vswhereExe = Join-Path $vsInstaller "vswhere.exe"
+$vsInstallPath = $null
+if (Test-Path -LiteralPath $vswhereExe) {
+    $vsInstallPath = & $vswhereExe -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath | Select-Object -First 1
+}
+
 $repoRoot = $PSScriptRoot | Split-Path -Parent
 $ninjaExe = Get-Command ninja.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
-if (-not $ninjaExe) {
+if (-not $ninjaExe -and $vsInstallPath) {
+    $ninjaExe = Join-Path $vsInstallPath "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+}
+if (-not $ninjaExe -or -not (Test-Path -LiteralPath $ninjaExe)) {
     $ninjaExe = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 }
 
@@ -50,12 +62,15 @@ if ($sccacheExe) {
     Write-Host "[WARN] sccache.exe not found under WinGet packages; compiler cache disabled"
 }
 
-$vsInstaller = "C:\Program Files (x86)\Microsoft Visual Studio\Installer"
 if (Test-Path (Join-Path $vsInstaller "vswhere.exe")) {
     $env:PATH = "$vsInstaller;$env:PATH"
 }
 
-$vcvarsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+$vcvarsPath = if ($vsInstallPath) {
+    Join-Path $vsInstallPath "VC\Auxiliary\Build\vcvarsall.bat"
+} else {
+    "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+}
 if (Test-Path $vcvarsPath) {
     Write-Host "[ENV] Activating MSVC via vcvarsall.bat x64"
     cmd /c "`"$vcvarsPath`" x64 > nul && set" | ForEach-Object {

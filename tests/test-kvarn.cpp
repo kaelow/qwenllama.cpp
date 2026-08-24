@@ -3242,14 +3242,23 @@ static void test_native_flash_attention_gpu() {
     if (std::getenv("GGML_KVARN_TEST_AMD_ROUTE_BOUNDARIES_ONLY") != nullptr) {
         require(route_stats_reset != nullptr && route_stats_get != nullptr,
                 "AMD route-boundary validation requires KVarN route telemetry");
-        require(hip_safe_first &&
-                (hip_physical_wave_size == 32 || hip_physical_wave_size == 64),
-                "AMD route-boundary validation did not find a safe-first HIP wave32/wave64 device");
 
         const char * attestation = std::getenv("GGML_KVARN_AMD_RUNTIME_ATTESTATION");
+        if (expect_vulkan_route_stats) {
+            // Vulkan does not expose the subgroup width through the public
+            // backend API. This focused path is selected explicitly for the
+            // attested RDNA wave64 device (for example Vulkan1 on the test host).
+            hip_physical_wave_size = 64;
+        } else {
+            require(hip_safe_first &&
+                    (hip_physical_wave_size == 32 || hip_physical_wave_size == 64),
+                    "AMD route-boundary validation did not find a safe-first HIP wave32/wave64 device");
+        }
         const bool attested_wave = attestation != nullptr &&
             ((hip_physical_wave_size == 32 && std::strcmp(attestation, "rdna-wave32") == 0) ||
-             (hip_physical_wave_size == 64 && std::strcmp(attestation, "cdna-wave64") == 0));
+             (hip_physical_wave_size == 64 &&
+                (std::strcmp(attestation, "cdna-wave64") == 0 ||
+                 std::strcmp(attestation, "rdna-wave64") == 0)));
         require(attested_wave,
                 "AMD runtime attestation does not match the physical wave reported by the backend");
 
@@ -3274,27 +3283,48 @@ static void test_native_flash_attention_gpu() {
             require(stats.decode_split == 0 && stats.amd_decode_split == 0 &&
                     stats.decode_vector == 0 && stats.amd_decode_vector == 0,
                     "AMD route-boundary case entered a CUDA-only specialized decode route");
-            const bool known_invalid_generic = hip_physical_wave_size == 32 ?
-                head_dim > 128 : head_dim > 256;
-            if (known_invalid_generic) {
-                require(stats.generic_shape_rejected > 0 && stats.portable_native > 0 &&
-                        stats.generic_mma == 0 && stats.prompt_prefill == 0,
-                        "known-invalid AMD MMA shape did not fall through to portable KVarN attention");
+            if (expect_vulkan_route_stats) {
+                // ABI-v2 maps these caller fields to the Vulkan suffix:
+                // fallback flags, body splits, tail splits, and max tail rows.
+                require(stats.portable_native > 0,
+                        "Vulkan AMD route-boundary case did not execute native KVarN attention");
+                require(stats.unified_body_exact_partial == 0,
+                        "Vulkan AMD route-boundary case reported a fallback reason");
+                require(stats.geometry_candidates > 0,
+                        "Vulkan AMD route-boundary case omitted body split telemetry");
+                if (tail_tokens > 0) {
+                    require(stats.geometry_split_8 > 0 && stats.geometry_split_16 <= 64,
+                            "Vulkan AMD exact tail was not segmented into bounded 64-row splits");
+                }
             } else {
-                require(stats.generic_mma + stats.prompt_prefill + stats.portable_native > 0,
-                        "AMD route-boundary case did not execute an optimized or portable native route");
-                require(stats.generic_shape_rejected == 0 || stats.portable_native > 0,
-                        "AMD generic rejection did not continue to portable KVarN attention");
+                const bool known_invalid_generic = hip_physical_wave_size == 32 ?
+                    head_dim > 128 : head_dim > 256;
+                if (known_invalid_generic) {
+                    require(stats.generic_shape_rejected > 0 && stats.portable_native > 0 &&
+                            stats.generic_mma == 0 && stats.prompt_prefill == 0,
+                            "known-invalid AMD MMA shape did not fall through to portable KVarN attention");
+                } else {
+                    require(stats.generic_mma + stats.prompt_prefill + stats.portable_native > 0,
+                            "AMD route-boundary case did not execute an optimized or portable native route");
+                    require(stats.generic_shape_rejected == 0 || stats.portable_native > 0,
+                            "AMD generic rejection did not continue to portable KVarN attention");
+                }
             }
         };
 
+        const std::vector<int> query_boundaries = expect_vulkan_route_stats ?
+            std::vector<int>{ 1, 2, 8, 512 } :
+            std::vector<int>{ 1, 2, 4, 8, 16, 17, 256, 511, 512 };
         for (int head_dim : { 128, 256, 512 }) {
-            for (int n_q : { 1, 2, 4, 8, 16, 17, 256, 511, 512 }) {
+            for (int n_q : query_boundaries) {
                 require_amd_case(head_dim, n_q, 6, 0, GGML_TYPE_F16,
                         "AMD KVarN route-boundary output differs from the materialized oracle");
             }
         }
-        for (int gqa : { 1, 2, 4, 6, 8, 16 }) {
+        const std::vector<int> gqa_boundaries = expect_vulkan_route_stats ?
+            std::vector<int>{ 1, 6, 16 } :
+            std::vector<int>{ 1, 2, 4, 6, 8, 16 };
+        for (int gqa : gqa_boundaries) {
             require_amd_case(128, 17, gqa, 0, GGML_TYPE_F16,
                     "AMD D128 GQA route-boundary output differs from the materialized oracle");
         }
@@ -3306,8 +3336,8 @@ static void test_native_flash_attention_gpu() {
                 }
             }
         }
-        std::printf("test-kvarn: AMD runtime validation attestation=%s physical_wave=%d OK\n",
-                attestation, hip_physical_wave_size);
+        std::printf("test-kvarn: AMD %s runtime validation attestation=%s physical_wave=%d OK\n",
+                expect_vulkan_route_stats ? "Vulkan" : "HIP", attestation, hip_physical_wave_size);
         ggml_backend_free(cpu_backend);
         ggml_backend_free(gpu_backend);
         return;

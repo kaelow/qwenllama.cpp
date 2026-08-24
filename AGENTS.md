@@ -9,6 +9,9 @@ architectural reference when rebasing fork features.
 BeeLlama.cpp is Anbeeld's llama.cpp fork. The v0.4.0 fork surface is intentionally
 small:
 
+The current v0.4.4 tree is merged through upstream llama.cpp b10599
+(`4a08fa297`).
+
 - Upstream speculative decoding, including `draft-dflash`, `draft-mtp`,
   EAGLE3, and n-gram modes.
 - KVarN target KV-cache compression for Qwen3.6 and Gemma 4, selected with

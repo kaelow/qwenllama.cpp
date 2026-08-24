@@ -7294,6 +7294,7 @@ struct test_flash_attn_ext : public test_case {
     const int64_t n_tail_active;
     const int64_t n_tail_history_slots;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
+    const bool v_is_view_of_k;
 
     std::string vars() override {
         return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
@@ -7309,7 +7310,8 @@ struct test_flash_attn_ext : public test_case {
             " scale=" + std::to_string(scale) +
             " n_tail_active=" + std::to_string(n_tail_active) +
             " n_tail_history_slots=" + std::to_string(n_tail_history_slots) +
-            " kv_view=" + std::to_string(int(kv_view));
+            " kv_view=" + std::to_string(int(kv_view)) +
+            " v_is_view_of_k=" + std::to_string(int(v_is_view_of_k));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7327,9 +7329,37 @@ struct test_flash_attn_ext : public test_case {
         // optional coverage: planning advertises the composite as executable,
         // so silently reporting NOT_SUPPORTED would recreate a scheduler CPU
         // fallback in the model graph.
-        return hsk == 512 && hsv == 512 && nr23[0] == 8 &&
+        const bool require_gemma_composite = hsk == 512 && hsv == 512 && nr23[0] == 8 &&
             type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0 &&
             canonical_body && n_tail_current > 0;
+
+        // Focused Vulkan validation sets this variable so an unsupported
+        // standard quantized-tail case is a hard failure instead of a skip.
+        // Keep it opt-in because the complete backend matrix intentionally
+        // includes devices that do not implement Bee's Vulkan-only route.
+        const auto is_standard_cache_quant = [](ggml_type type) {
+            switch (type) {
+                case GGML_TYPE_Q2_0S:
+                case GGML_TYPE_Q2_1:
+                case GGML_TYPE_Q3_0:
+                case GGML_TYPE_Q3_1:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q6_0:
+                case GGML_TYPE_Q6_1:
+                case GGML_TYPE_Q8_0:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+        const bool require_vulkan_tail = std::getenv("GGML_BACKEND_OPS_REQUIRE_BEE_VULKAN_TAIL") != nullptr &&
+            n_tail > 0 && hsk == hsv && (hsk == 128 || hsk == 256 || hsk == 512) &&
+            is_standard_cache_quant(type_K) && is_standard_cache_quant(type_V);
+
+        return require_gemma_composite || require_vulkan_tail;
     }
 
     double max_nmse_err() override {
@@ -7370,14 +7400,16 @@ struct test_flash_attn_ext : public test_case {
                         bool full_coverage_equivalence = false, bool split_equivalence = false,
                         int64_t n_tail_current = 0, bool segmented_equivalence = false,
                         float scale = 0.0f, int64_t n_tail_active = -1,
-                        int64_t n_tail_history_slots = 0, bool kv_view = true)
+                        int64_t n_tail_history_slots = 0, bool kv_view = true,
+                        bool v_is_view_of_k = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
           tail_all_masked(tail_all_masked), canonical_body(canonical_body),
           full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
           n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
-          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots), kv_view(kv_view) {}
+          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots), kv_view(kv_view),
+          v_is_view_of_k(v_is_view_of_k) {}
 
     test_flash_attn_ext(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
                         bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
@@ -7385,6 +7417,15 @@ struct test_flash_attn_ext : public test_case {
         : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec,
                              type_K, type_V, permute, 0, false, GGML_TYPE_F16, GGML_TYPE_COUNT,
                              false, false, false, false, false, 0, false, 0.0f, -1, 0, kv_view) {}
+
+    test_flash_attn_ext(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                        bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
+                        ggml_type type_K, ggml_type type_V, std::array<int32_t, 4> permute,
+                        bool kv_view, bool v_is_view_of_k)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec,
+                             type_K, type_V, permute, 0, false, GGML_TYPE_F16, GGML_TYPE_COUNT,
+                             false, false, false, false, false, 0, false, 0.0f, -1, 0,
+                             kv_view, v_is_view_of_k) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7416,14 +7457,14 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
-        if (type_K == type_V && hsk_padded == 576 && hsv_padded == 512) {
-            // TODO: this branch should become a separate test case parameter instead of hardcoding this for these head shapes
-
-            // in this branch, the V cache is sub-view of the K cache. this is used by some MLA-based models
+        if (v_is_view_of_k) {
+            // the V cache is a sub-view of the K cache. this is used by some MLA-based models
             // for more info:
             //   - https://github.com/ggml-org/llama.cpp/pull/13435
             //   - https://github.com/ggml-org/llama.cpp/pull/18953#issuecomment-3774948392
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
+            GGML_ASSERT(type_K == type_V && hsv_padded <= hsk_padded);
+
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
             v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view); // the V tensor is usually a view of the V cache
@@ -10448,12 +10489,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                     for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
                                                         if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
+                                                        // DeepSeek MLA: the V cache is a sub-view of the K cache
+                                                        const bool v_is_view_of_k = hsk == 576;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
-                                                                    hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV));
+                                                                    hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 1, 2, 3}, true, v_is_view_of_k));
                                                         // run fewer test cases permuted
                                                         if (mask == true && max_bias == 0.0f && logit_softcap == 0 && kv == 512) {
                                                             test_cases.emplace_back(new test_flash_attn_ext(
-                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 2, 1, 3}));
+                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 2, 1, 3}, true, v_is_view_of_k));
                                                         }
                                                     }
                                                 }
@@ -10485,24 +10528,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 4, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {2, 1}, 256, 2, true, false, 0, 0,
         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 4, false, GGML_TYPE_BF16));
-    // Bee standard low-bit KV families: cover every new body type in an
-    // attached-tail CUDA descriptor. Symmetric rows exercise the native route;
-    // the ordered family pairs are the operand shapes used by the capability
-    // test's forced-generic (explicit-bias) route.
+    // Bee standard low-bit KV families: cover every new body type in a
+    // production-supported D128 exact-tail composite. Symmetric rows exercise
+    // the native route; the ordered family pairs are the operand shapes used
+    // by the capability test's forced-generic (explicit-bias) route.
     const std::pair<ggml_type, int64_t> low_bit_native[] = {
         { GGML_TYPE_Q2_0S, 16 }, { GGML_TYPE_Q2_1,  32 },
         { GGML_TYPE_Q3_0,  64 }, { GGML_TYPE_Q3_1, 128 },
         { GGML_TYPE_Q6_0,  16 }, { GGML_TYPE_Q6_1,  32 },
     };
     for (const auto & [body_type, n_tail] : low_bit_native) {
-        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 2, true, false, 0, 0,
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 256, 2, true, false, 0, 0,
             GGML_PREC_F32, body_type, body_type, {0, 1, 2, 3}, n_tail, false, GGML_TYPE_F16));
     }
     for (const auto & body_types : {
             std::pair{ GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 },
             std::pair{ GGML_TYPE_Q3_0,  GGML_TYPE_Q3_1 },
             std::pair{ GGML_TYPE_Q6_0,  GGML_TYPE_Q6_1 } }) {
-        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 2, true, false, 0, 0,
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 256, 2, true, false, 0, 0,
             GGML_PREC_F32, body_types.first, body_types.second, {0, 1, 2, 3}, 64, false, GGML_TYPE_BF16));
     }
     // Vulkan segmented-tail boundaries.  These rows prove that exact tokens
@@ -10527,6 +10570,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         256, 256, 4, {8, 1}, 4096, 1, true, false, 0, 0,
         GGML_PREC_F32, GGML_TYPE_Q6_1, GGML_TYPE_Q6_0,
         {0, 1, 2, 3}, 128, false, GGML_TYPE_BF16));
+    // Upstream cache families used by the production baseline still share the
+    // same segmented overlay. Cover the asymmetric q8/q5 decode route and one
+    // genuinely populated 1024-row q5 tail instead of inferring them from q6.
+    test_cases.emplace_back(new test_flash_attn_ext(
+        256, 256, 4, {8, 1}, 4096, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1,
+        {0, 1, 2, 3}, 128, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(
+        128, 128, 4, {2, 1}, 1152, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0,
+        {0, 1, 2, 3}, 1024, false, GGML_TYPE_F16));
     // Vulkan native FA coverage for Bee's standard cache quants. Keep these
     // independent from the exact-tail composite so a host/scheduler fallback
     // cannot hide a missing body pipeline. Every ordered K/V pair is covered
@@ -10721,11 +10775,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
-    // MLA shape (V is a view of K) with quantized KV
-    // (the test harness builds V as a view of K for this shape; see build_graph)
-    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+
+    // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
+    test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1},  512, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(64,  64,  4, {1, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
 
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
