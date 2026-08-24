@@ -107,7 +107,8 @@ void main() {
 
 #define tile_row(r) (row_tid * rows_per_thread + (r))
 
-    uint32_t q_offset = gqa_iq1*p.nb01 + (iq2*p.nb02 + iq3*p.nb03) / 4;
+    uint32_t q_offset = (query_base + gqa_iq1)*p.nb01 +
+        (iq2*p.nb02 + iq3*p.nb03) / 4;
 
     [[unroll]] for (uint32_t idx = 0; idx < Br * HSK / 4; idx += gl_WorkGroupSize.x) {
         uint32_t d = (idx + tid) % (HSK / 4);
@@ -121,13 +122,13 @@ void main() {
         const uint buf_ib = r * qf_stride + d / 8;
         const uint buf_iqs = d % 8;
 
-        FLOAT_TYPEV4 vals = is_in_bounds ? FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale) : FLOAT_TYPEV4(0.0f);
-        const FLOAT_TYPEV4 abs_vals = abs(vals);
+        vec4 vals = is_in_bounds ? data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale : vec4(0.0f);
+        const vec4 abs_vals = abs(vals);
 
-        const FLOAT_TYPE thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
-        const FLOAT_TYPE amax = subgroupClusteredMax(thread_max, 8);
-        const FLOAT_TYPE qd = amax / FLOAT_TYPE(127.0);
-        const FLOAT_TYPE qd_inv = qd != FLOAT_TYPE(0.0) ? FLOAT_TYPE(1.0) / qd : FLOAT_TYPE(0.0);
+        const float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
+        const float amax = subgroupClusteredMax(thread_max, 8);
+        const float qd = amax / 127.0f;
+        const float qd_inv = qd != 0.0f ? 1.0f / qd : 0.0f;
         vals = round(vals * qd_inv);
 
         Qf[buf_ib].qs[buf_iqs] = pack32(i8vec4(vals));
@@ -136,11 +137,11 @@ void main() {
         // the row-sum scaled by qd, used in k_dot_correction.
         if (FaTypeK == FA_TYPE_Q8_0) {
             if (buf_iqs == 0) {
-                Qf[buf_ib].ds = FLOAT_TYPEV2(qd, 0.0);
+                Qf[buf_ib].ds = FLOAT_TYPEV2(qd, 0.0f);
             }
         } else {
-            const FLOAT_TYPE thread_sum = vals.x + vals.y + vals.z + vals.w;
-            const FLOAT_TYPE sum = subgroupClusteredAdd(thread_sum, 8);
+            const float thread_sum = vals.x + vals.y + vals.z + vals.w;
+            const float sum = subgroupClusteredAdd(thread_sum, 8);
 
             if (buf_iqs == 0) {
                 Qf[buf_ib].ds = FLOAT_TYPEV2(qd, sum * qd);
@@ -186,7 +187,7 @@ void main() {
     // FaBlockBytesK/V == 2 for f16, 16 for f32, ggml block byte size for quants.
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
-    uint32_t m_offset = gqa_iq1*KV;
+    uint32_t m_offset = (query_base + gqa_iq1)*KV;
     if (p.nem2 != 1 || p.nem3 != 1) {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
         mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
@@ -210,7 +211,7 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
-                bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
+                bool nem1_bounds_check = !(gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 barrier();
@@ -656,10 +657,10 @@ void main() {
 
     // If there is split_k, then the split_k resolve shader does the final
     // division by L. Store the intermediate O value and per-row m and L values.
-    if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
+    if (k_num > 1) {
+        if (gqa_ratio > 1) {
             // note: O and Q have swapped coord 1,2.
-            uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
+            uint32_t o_offset = HSV * p.ne1 * (split_k_index + k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
 
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 const uint row = tile_row(r);
@@ -670,7 +671,7 @@ void main() {
                 }
             }
 
-            o_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
+            o_offset = HSV * p.ne1 * k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + k_num * (gqa_iq1 + p.ne2 * iq3));
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 const uint row = tile_row(r);
                 if (row < N) {
@@ -684,7 +685,7 @@ void main() {
                 const uint global_row = i * Br + row;
 
                 if (global_row < N) {
-                    uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (global_row + p.ne2 * iq3)) / 4;
+                    uint32_t o_offset = HSV * p.ne1 * (split_k_index + k_num * (global_row + p.ne2 * iq3)) / 4;
 
                     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
                         data_ov4[o_offset + iq2 * HSV/4 + d * D_split + d_tid] = D_TYPEV4(Of[r][d]);
@@ -692,7 +693,7 @@ void main() {
                 }
 
                 if (global_row < N && d_tid == 0 && col_tid == 0) {
-                    uint32_t lm_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (global_row + p.ne2 * iq3));
+                    uint32_t lm_offset = HSV * p.ne1 * k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + k_num * (global_row + p.ne2 * iq3));
                     data_o[lm_offset + iq2] = D_TYPE(Lf[r]);
                     data_o[lm_offset + p.ne1 + iq2] = D_TYPE(Mf[r]);
                 }
@@ -738,7 +739,7 @@ void main() {
 
     uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
 
-    if (p.gqa_ratio > 1) {
+    if (gqa_ratio > 1) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             const uint row = tile_row(r);
             if (row < N) {

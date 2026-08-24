@@ -30,6 +30,28 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(server_prompt_checkpoint_boundary(3,     4, 128) == 0);
 }
 
+static void speculative_tail_reserve_is_decoupled_from_recurrent_snapshots() {
+    {
+        const auto defaults = llama_context_default_params();
+        assert(defaults.n_rs_seq == 0);
+        assert(defaults.kv_tail_rollback_tokens == 0);
+    }
+
+    common_params params;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_MOD };
+    params.speculative.ngram_mod.n_max = 32;
+
+    auto cparams = common_context_params_to_llama(params);
+    assert(cparams.n_rs_seq == 0);
+    assert(cparams.kv_tail_rollback_tokens == 32);
+
+    params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    params.speculative.draft.n_max = 2;
+    cparams = common_context_params_to_llama(params);
+    assert(cparams.n_rs_seq == 2);
+    assert(cparams.kv_tail_rollback_tokens == 32);
+}
+
 static server_prompt make_prompt(const llama_tokens & tokens) {
     server_prompt prompt;
     prompt.tokens = server_tokens(tokens, false);
@@ -325,6 +347,7 @@ int main() {
     prompt_cache_load_target_success_draft_failure_is_atomic();
     restore_transaction_validation_failures_are_atomic();
     speculative_rollback_checkpoint_boundary();
+    speculative_tail_reserve_is_decoupled_from_recurrent_snapshots();
     checkpoint_failed_target_save_cannot_reuse_stale_bytes();
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();

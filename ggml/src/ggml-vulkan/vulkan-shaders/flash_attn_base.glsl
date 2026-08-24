@@ -99,6 +99,12 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define FA_TYPE_Q8_0  8u
 #define FA_TYPE_IQ4_NL 20u
 #define FA_TYPE_BF16 30u
+#define FA_TYPE_Q6_0 43u
+#define FA_TYPE_Q6_1 44u
+#define FA_TYPE_Q3_0 45u
+#define FA_TYPE_Q3_1 46u
+#define FA_TYPE_Q2_0S 47u
+#define FA_TYPE_Q2_1 48u
 
 #if defined(BFLOAT16)
 #define O_TYPE float
@@ -122,6 +128,12 @@ uint fa_block_elems(uint ty) {
         case FA_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
         case FA_TYPE_IQ4_NL: return uint(QUANT_K_IQ4_NL);
         case FA_TYPE_BF16: return 1u;
+        case FA_TYPE_Q6_0: return uint(QUANT_K_Q6_0);
+        case FA_TYPE_Q6_1: return uint(QUANT_K_Q6_1);
+        case FA_TYPE_Q3_0: return uint(QUANT_K_Q3_0);
+        case FA_TYPE_Q3_1: return uint(QUANT_K_Q3_1);
+        case FA_TYPE_Q2_0S: return uint(QUANT_K_Q2_0S);
+        case FA_TYPE_Q2_1: return uint(QUANT_K_Q2_1);
         default:           return 1u;
     }
 }
@@ -173,7 +185,7 @@ ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in A
 // Load the slope matrix, indexed by Q's dimension 2.
 ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t h = iq2 + (r % (p.gqa_ratio & 0xffffu));
 
     uint32_t n_head_log2 = p.mask_n_head_log2 & N_LOG2_MASK;
 
@@ -186,32 +198,40 @@ ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const i
 // Load the sink value, indexed by Q's dimension 2.
 ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t h = iq2 + (r % (p.gqa_ratio & 0xffffu));
 
     return ACC_TYPE(data_s[h]);
 }
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride;
+         q_stride, k_stride, v_stride, m_stride, gqa_ratio, query_base,
+         k_num, dispatch_k_num;
 
 void init_indices()
 {
     N = p.N;
     KV = p.KV;
+    gqa_ratio = p.gqa_ratio & 0xffffu;
+    query_base = p.gqa_ratio >> 16u;
+    k_num = p.k_num & 0xffffu;
+    dispatch_k_num = p.k_num >> 16u;
+    if (dispatch_k_num == 0u) {
+        dispatch_k_num = k_num;
+    }
 
-    if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
+    if (k_num > 1) {
+        if (gqa_ratio > 1) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
-            gqa_iq1 = gl_WorkGroupID.x / p.k_num;
-            split_k_index = gl_WorkGroupID.x % p.k_num;
+            gqa_iq1 = gl_WorkGroupID.x / dispatch_k_num;
+            split_k_index = gl_WorkGroupID.x % dispatch_k_num;
         } else {
             gqa_iq1 = 0;
-            split_k_index = gl_WorkGroupID.x % p.k_num;
-            i = gl_WorkGroupID.x / p.k_num;
+            split_k_index = gl_WorkGroupID.x % dispatch_k_num;
+            i = gl_WorkGroupID.x / dispatch_k_num;
         }
-    } else if (p.gqa_ratio > 1) {
+    } else if (gqa_ratio > 1) {
         i = 0;
         gqa_iq1 = gl_WorkGroupID.x;
         split_k_index = 0;
@@ -228,7 +248,7 @@ void init_indices()
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
-    iq2 = gl_WorkGroupID.y * p.gqa_ratio;
+    iq2 = gl_WorkGroupID.y * gqa_ratio;
     iq3 = gl_WorkGroupID.z;
 
     // broadcast factors
@@ -249,14 +269,11 @@ void init_indices()
     // nb?1 are already divided by the type size and are in units of elements.
     // When using grouped query attention, Q is indexed by iq2, so the stride
     // should be nb02 (which is in bytes).
-    q_stride = p.gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
+    q_stride = gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
-    // When using grouped query attention, all rows use the same mask (stride 0).
-    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
-    // that prevents the compiler from folding the "&" through the select
-    // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    // When using grouped query attention, all rows use the same mask.
+    m_stride = gqa_ratio > 1 ? 0u : KV;
 }
 
 // Bias applied to softmax to stay in fp16 range.

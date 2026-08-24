@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.4
+
+- Updated the llama.cpp base through upstream commit `84e908c6`. Notable inherited changes include Granite-Switch and Muse Glimmer model support, MTP support for Nemotron and DFlash support for Nemotron 3.5, Pocket TTS audio generation, multi-output backend sampling for speculative decoding, media-aware server slot save/restore, the Web UI `read_media` tool, and expanded tool isolation through SSH and rootless Podman. The merge also adds the default `load-mode auto` policy that avoids memory mapping on integrated GPUs, Vulkan TQ2_0 support, a warp-per-row CUDA WKV7 kernel for single-token decode, narrower CUDA-graph synchronization, hardened GGUF loading, semantic versioning, and version-aware CMake package metadata.
+- Optimized native KVarN SWA attention on CPU and CUDA. CPU attention resolves each token source once and loads complete K/V rows, CUDA portable attention consumes rotated stage rows directly, and the CUDA MMA path reconstructs original-domain stage tiles cooperatively only when required. CUDA route selection now records the retained split geometry and device capabilities without model- or GPU-name-specific policy.
+- Fixed fully covered non-SWA KVarN windows so they use native exact storage and bypass the compact precision-tail execution route. SWA compact rings continue to use their requested KVarN planner types.
+
 ## v0.4.3
 
 - Updated the llama.cpp base through upstream commit `74ce15741`. Notable inherited changes include Qwen3-TTS, DeepSeek V4 and DSpark, MTP support for GLM-4.7-Flash, GLM-5.2, Qwen3-Next, and DeepSeek V3.2, router LRU scheduling, initial Docker tool isolation, working-directory and filesystem tools in the server and Web UI, speculative metrics, and broad CUDA, Metal, Vulkan, SYCL, WebGPU, multimodal, conversion, and UI updates. ggml is now 0.19.0 and the RPC protocol is 5.0.1.

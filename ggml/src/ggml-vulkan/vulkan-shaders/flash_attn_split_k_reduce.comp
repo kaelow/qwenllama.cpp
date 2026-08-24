@@ -17,6 +17,8 @@ layout (push_constant) uniform parameter {
     uint ne3;
     uint k_num;
     uint sinks;
+    uint query_base;
+    uint dst_ne2;
 } p;
 
 shared float tmpsh[BLOCK_SIZE];
@@ -116,6 +118,6 @@ void main() {
         const float FLT_MAX = uintBitsToFloat(0x7F7FFFFF);
         O = clamp(O, -FLT_MAX, FLT_MAX);
 
-        data_d[(i3 * p.ne2 + i2) * p.ne1 * D + D * n + d] = O;
+        data_d[(i3 * p.dst_ne2 + p.query_base + i2) * p.ne1 * D + D * n + d] = O;
     }
 }

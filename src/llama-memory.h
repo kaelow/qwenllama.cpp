@@ -146,6 +146,10 @@ struct llama_memory_i {
 
     virtual seq_rm_capability get_seq_rm_capability() const { return {}; }
 
+    // True when this memory owns neural/recurrent state that cannot be
+    // reconstructed by trimming an attention-cache suffix alone.
+    virtual bool has_recurrent_state() const { return false; }
+
     virtual bool seq_rm_plan(
             llama_seq_id seq_id, llama_pos p0, llama_pos p1,
             llama_pos & planned_p0, llama_pos & planned_p1) const {

@@ -68,6 +68,7 @@ public:
 
     bool get_can_shift() const override;
     seq_rm_capability get_seq_rm_capability() const override;
+    bool has_recurrent_state() const override { return true; }
 
     void clear(bool data) override;
 
