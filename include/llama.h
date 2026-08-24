@@ -878,6 +878,11 @@ extern "C" {
     LLAMA_API llama_memory_seq_rm_capability llama_memory_get_seq_rm_capability(
             llama_memory_t mem);
 
+    // Returns whether the memory contains recurrent/neural state in addition
+    // to (or instead of) an attention cache.
+    LLAMA_API bool llama_memory_has_recurrent_state(
+            llama_memory_t mem);
+
     // Computes a side-effect-free removable range. The returned range may be a
     // broader suffix than requested, but is accepted by the complete memory.
     LLAMA_API bool llama_memory_seq_rm_plan(
@@ -1090,6 +1095,12 @@ extern "C" {
 // Unlike PARTIAL_ONLY, this representation owns every payload required after
 // the source sequence is removed and may remap physical cells on restore.
 #define LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED 8
+
+// Save only recurrent/neural state from a hybrid context. This is intended for
+// partial checkpoints whose attention cache can be rolled back independently.
+// Restore the state first, then remove the uncommitted attention suffix from
+// the complete memory module.
+#define LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY 16
 
     LLAMA_API bool llama_memory_state_seq_can_save_ext(
             llama_memory_t mem,

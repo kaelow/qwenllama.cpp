@@ -153,7 +153,11 @@ uint v_bits() {
 }
 
 uint body_splits() {
-    return (p.bits_packed >> 8u) & 0xffffu;
+    return (p.bits_packed >> 8u) & 0x7fffu;
+}
+
+bool coalesced_tail() {
+    return ((p.bits_packed >> 23u) & 1u) != 0u;
 }
 
 uint tail_splits() {
@@ -246,6 +250,7 @@ shared float sh_maximum[GQA_GROUP_MAX];
 shared float sh_denominator[GQA_GROUP_MAX];
 #endif
 shared int sh_active;
+shared uint sh_tail_tile_enabled;
 #endif
 
 #ifdef KVAR_RECORD_TILE
@@ -690,9 +695,14 @@ void main() {
         RunDescRef run_desc = RunDescRef(p.run_desc_addr);
         const uint desc_base = uint(sh_active) * p.run_desc_ne0;
         tail_token_count = uint(max(run_desc.data[desc_base + 4u], 0));
-        const uint tail_split = split_index - n_body_splits;
-        split_tile_begin = tail_split;
-        split_tile_end = tail_split + 1u;
+        if (coalesced_tail()) {
+            split_tile_begin = 0u;
+            split_tile_end = (tail_token_count + 63u) / 64u;
+        } else {
+            const uint tail_split = split_index - n_body_splits;
+            split_tile_begin = tail_split;
+            split_tile_end = tail_split + 1u;
+        }
     }
 
 #ifdef KVAR_COOPMAT_PREFILL
@@ -752,6 +762,34 @@ void main() {
     const uint token_end = min(token_begin + 64u,
         process_body ? p.n_kv : tail_token_count);
     const uint tile_tokens = token_end - min(token_begin, token_end);
+
+    // A compact prefill descriptor contains the union of the persistent tail
+    // and every row produced by the current ubatch. For PP512/tail128 that is
+    // commonly 640 candidates, while a packed group of six adjacent queries
+    // can see only about 133 of them. Reject wholly masked chunks before any
+    // K/V loads or cooperative-matrix work. The decision is workgroup-uniform,
+    // so skipped chunks simply leave the online softmax state unchanged.
+    if (process_tail && coalesced_tail()) {
+        if (lane == 0u) {
+            sh_tail_tile_enabled = 0u;
+        }
+        barrier();
+        for (uint item = lane; item < tile_tokens * queries_here;
+                item += gl_WorkGroupSize.x) {
+            const uint local_token = item % tile_tokens;
+            const uint local_query = item / tile_tokens;
+            const uint row_query = query_base() + local_query_base + local_query;
+            const float mask_value = load_tail_mask(
+                token_begin + local_token, row_query, out_stream);
+            if (!(isinf(mask_value) && mask_value < 0.0)) {
+                atomicOr(sh_tail_tile_enabled, 1u);
+            }
+        }
+        barrier();
+        if (sh_tail_tile_enabled == 0u) {
+            continue;
+        }
+    }
 
     if (process_tail) {
         RunDescRef run_desc = RunDescRef(p.run_desc_addr);

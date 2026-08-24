@@ -20,6 +20,10 @@ struct ggml_vk_fattn_kvarn_plan_input {
     // a backend-native kernel.  The workspace planner may still tile queries,
     // but must preserve the supplied body partial layout.
     uint32_t body_splits_override = 0;
+    // Cooperative prefill can merge every exact-tail tile online inside one
+    // workgroup. Keep a single reducer plane for that route instead of one
+    // transient plane per 64-token chunk.
+    bool coalesce_tail = false;
 };
 
 struct ggml_vk_fattn_kvarn_plan_result {
@@ -66,20 +70,22 @@ inline ggml_vk_fattn_kvarn_plan_result ggml_vk_fattn_kvarn_plan(
     }
 
     uint32_t tail_splits = input.tail_tokens > 0 ?
-        (input.tail_tokens + 63u) / 64u : 0u;
+        (input.coalesce_tail ? 1u : (input.tail_tokens + 63u) / 64u) : 0u;
     tail_splits = std::min(tail_splits, 255u);
-    body_splits = std::min(body_splits, 65535u);
+    // The high bit of the packed 16-bit body field selects online tail
+    // coalescing, leaving 15 bits for the body split count.
+    body_splits = std::min(body_splits, 0x7fffu);
 
     uint32_t split_k = body_splits + tail_splits;
     if (split_k == 0) {
         split_k = 1;
     }
 
-    // Keep body half-records and exact-tail 64-token chunks independent.  If
-    // reducing every query at once would exceed the transient budget, tile the
-    // query dimension instead of coalescing token chunks and reintroducing a
-    // serial tail.  Reducing the body split count is only a last-resort route
-    // for shapes where even a single query would not fit.
+    // Decode and portable routes keep exact-tail 64-token chunks independent.
+    // Cooperative prefill may instead merge those chunks online into one
+    // partial. If reducing every query at once would exceed the transient
+    // budget, tile the query dimension. Reducing the body split count is only
+    // a last-resort route for shapes where even a single query would not fit.
     const uint64_t bytes_per_query_split = input.head_dim == 0 ? 0 :
         (uint64_t(input.head_dim) + 2u) * sizeof(float) *
         input.n_query_heads * input.n_stream;
@@ -118,7 +124,7 @@ inline ggml_vk_fattn_kvarn_plan_result ggml_vk_fattn_kvarn_plan(
         (input.n_query + query_tile - 1u) / query_tile;
     const uint64_t workspace_bytes = bytes_per_query_split * split_k * query_tile;
     const uint32_t max_tail_tokens_per_split = tail_splits > 0 ?
-        std::min(input.tail_tokens, 64u) : 0u;
+        (input.coalesce_tail ? input.tail_tokens : std::min(input.tail_tokens, 64u)) : 0u;
     return { gqa_group_size, workgroups_y, split_k, body_splits,
         tail_splits, max_tail_tokens_per_split, query_tile, query_tiles,
         workspace_bytes, workspace_supported };

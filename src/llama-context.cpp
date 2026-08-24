@@ -4738,6 +4738,10 @@ llama_memory_seq_rm_capability llama_memory_get_seq_rm_capability(llama_memory_t
     };
 }
 
+bool llama_memory_has_recurrent_state(llama_memory_t mem) {
+    return mem != nullptr && mem->has_recurrent_state();
+}
+
 bool llama_memory_seq_rm_plan(
         llama_memory_t mem,
           llama_seq_id seq_id,

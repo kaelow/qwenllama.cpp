@@ -39,6 +39,14 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Hybrid Qwen targets keep a small recurrent snapshot horizon for MTP while
+// their attention cache independently reserves the maximum configured draft
+// suffix. A speculative checkpoint therefore needs only the recurrent planes;
+// the attention suffix is removed directly after the checkpoint commits.
+static constexpr llama_state_seq_flags SERVER_SPECULATIVE_CHECKPOINT_FLAGS =
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+        LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY;
+
 static bool server_reasoning_budget_state_is_reasoning(common_reasoning_budget_state state) {
     return state == REASONING_BUDGET_COUNTING ||
            state == REASONING_BUDGET_WAITING_UTF8 ||
@@ -2560,6 +2568,21 @@ private:
         return n_tokens >= 0 && n_tokens%alignment == 0;
     }
 
+    llama_state_seq_flags prompt_checkpoint_flags() const {
+        llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        // A KVarN suffix can be trimmed natively to a complete descriptor
+        // boundary. In a hybrid Qwen context only the recurrent planes need a
+        // durable checkpoint; serializing the compressed attention body here
+        // turns the first incremental prompt batch into a context-sized GPU to
+        // host copy. The normal suffix transaction removes KVarN rows after
+        // the recurrent state has been restored.
+        if (params_base.kvarn.type != LLAMA_KVARN_TYPE_DISABLED &&
+                llama_memory_has_recurrent_state(llama_get_memory(ctx_tgt))) {
+            flags |= LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY;
+        }
+        return flags;
+    }
+
     size_t prompt_live_native_restorable(
             const server_slot & slot,
             const server_tokens & requested) const {
@@ -2655,7 +2678,7 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(n_tokens_checkpoint, pos_min, pos_max);
 
-        constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        const llama_state_seq_flags flags = prompt_checkpoint_flags();
         const auto target = cur.update_tgt(ctx_tgt, slot.id, flags);
         const auto draft  = cur.update_dft(ctx_dft, slot.id, flags);
         if (!target.ok() || !draft.ok() || cur.empty()) {
@@ -2701,9 +2724,10 @@ private:
         const auto & admitted = slot.prompt.checkpoints.back();
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, recurrent_only = %s)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, admitted.pos_min,
-                admitted.pos_max, admitted.n_tokens, (float) admitted.size() / 1024 / 1024);
+                admitted.pos_max, admitted.n_tokens, (float) admitted.size() / 1024 / 1024,
+                (flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) != 0 ? "yes" : "no");
     }
 
     bool restore_checkpoint_transaction(
@@ -2713,9 +2737,10 @@ private:
             llama_context * draft,
             bool restore_target,
             bool restore_draft,
-            bool restore_speculative) {
+            bool restore_speculative,
+            llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
         const bool restored = server_prompt_restore_transaction(
-                target, draft, spec.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+                target, draft, spec.get(), slot.id, flags,
                 { checkpoint.data_tgt.data(), checkpoint.data_tgt.size() },
                 { checkpoint.data_dft.data(), checkpoint.data_dft.size() },
                 { checkpoint.data_spec.data(), checkpoint.data_spec.size() },
@@ -3421,7 +3446,7 @@ private:
 
                         if (use_ckpt_dft) {
                             const auto capture = slot.spec_ckpt.update_dft(
-                                    ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    ctx_dft, slot.id, SERVER_SPECULATIVE_CHECKPOINT_FLAGS);
                             if (!capture.ok()) {
                                 SLT_WRN(slot, "failed to capture draft checkpoint (status = %d, bytes = %zu)\n",
                                         int(capture.status), capture.bytes);
@@ -3492,7 +3517,7 @@ private:
                 if (use_ckpt_dft) {
                     if (!restore_checkpoint_transaction(
                                 slot, ckpt, nullptr, ctx_dft,
-                                false, true, false)) {
+                                false, true, false, SERVER_SPECULATIVE_CHECKPOINT_FLAGS)) {
                         draft.clear();
                         return;
                     }
@@ -3527,7 +3552,7 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     const auto capture = ckpt.update_tgt(
-                            ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ctx_tgt, slot.id, SERVER_SPECULATIVE_CHECKPOINT_FLAGS);
                     if (!capture.ok()) {
                         SLT_WRN(slot, "failed to capture target speculative checkpoint (status = %d, bytes = %zu)\n",
                                 int(capture.status), capture.bytes);
@@ -3551,7 +3576,7 @@ private:
 
                 if (use_ckpt_dft) {
                     const auto capture = ckpt.update_dft(
-                            ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ctx_dft, slot.id, SERVER_SPECULATIVE_CHECKPOINT_FLAGS);
                     if (!capture.ok()) {
                         SLT_WRN(slot, "failed to capture draft speculative checkpoint (status = %d, bytes = %zu)\n",
                                 int(capture.status), capture.bytes);
@@ -3890,7 +3915,8 @@ private:
                                         if (!do_reset) {
                                             do_reset = !restore_checkpoint_transaction(
                                                     slot, *it, ctx_tgt, ctx_dft,
-                                                    true, ctx_dft != nullptr, true);
+                                                    true, ctx_dft != nullptr, true,
+                                                    prompt_checkpoint_flags());
                                             if (!do_reset) {
                                                 pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                                 n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -4701,7 +4727,7 @@ private:
 
                         if (!restore_checkpoint_transaction(
                                     slot, ckpt, slot.ctx_tgt, slot.ctx_dft,
-                                    true, use_ckpt_dft, true)) {
+                                    true, use_ckpt_dft, true, SERVER_SPECULATIVE_CHECKPOINT_FLAGS)) {
                             SLT_ERR(slot, "%s", "failed to restore speculative checkpoint transaction\n");
                             restore_verification_state();
                             schedule_speculative_target_only_replay(

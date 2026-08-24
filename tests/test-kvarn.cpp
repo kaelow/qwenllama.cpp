@@ -184,6 +184,19 @@ static void test_vulkan_decode_route_policy() {
     require(tiled_prefill.workspace_bytes <= 128ull * 1024ull * 1024ull,
             "query-tiled PP512 exceeded the 128 MiB transient budget");
 
+    const auto coalesced_prefill = ggml_vk_fattn_kvarn_plan({
+        19488, 512, 24, 4, 1, 96, 640, 256,
+        128ull * 1024ull * 1024ull, 16, false, 6, 0, true,
+    });
+    require(coalesced_prefill.body_splits == 1 &&
+            coalesced_prefill.tail_splits == 1 &&
+            coalesced_prefill.max_tail_tokens_per_split == 640,
+            "cooperative PP512 must merge the compact exact tail online");
+    require(coalesced_prefill.query_tile == 512 &&
+            coalesced_prefill.query_tiles == 1 &&
+            coalesced_prefill.workspace_bytes <= 128ull * 1024ull * 1024ull,
+            "coalesced PP512 must remain a single budgeted query tile");
+
     const auto packed_small_prefill = ggml_vk_fattn_kvarn_plan({
         19488, 64, 24, 4, 1, 96, 128, 256,
         128ull * 1024ull * 1024ull, 16, false, 6,

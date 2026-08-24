@@ -10707,7 +10707,7 @@ static ggml_vk_kvarn_store_workspace_plan ggml_vk_kvarn_store_workspace_plan_for
         hint_well_formed ? n_tokens / tokens_per_stream_hint : 0;
     const bool runtime_workspace =
         hint_well_formed &&
-        tokens_per_stream_hint >= 3 * KVAR_N_GROUP &&
+        tokens_per_stream_hint >= KVAR_N_GROUP &&
         active_streams > 0 && active_streams <= n_stream &&
         (!swa || (n_stream == 1 &&
                   tokens_per_stream_hint <= groups_per_stream * KVAR_N_GROUP));
@@ -10718,7 +10718,7 @@ static ggml_vk_kvarn_store_workspace_plan ggml_vk_kvarn_store_workspace_plan_for
     // remains shared with the runtime planner below.
     const bool reserve_workspace =
         reserve_worst_case &&
-        n_tokens >= 3 * KVAR_N_GROUP &&
+        n_tokens >= KVAR_N_GROUP &&
         (!swa || (n_stream == 1 &&
                   n_tokens <= groups_per_stream * KVAR_N_GROUP));
     const bool use_workspace = runtime_workspace || reserve_workspace;
@@ -12021,6 +12021,12 @@ static uint32_t ggml_vk_kvarn_dispatch_query_tile(
         uint32_t n_query,
         uint32_t cooperative_query_pack) {
     uint32_t query_tile = route.split_k > 1 ? route.query_tile : n_query;
+    if (query_tile >= n_query) {
+        // The cooperative shader masks the unused rows of its final query
+        // pack. Rounding a full PP512 tile down to 510 would create a second
+        // two-query dispatch which rescans the complete KVarN body.
+        return n_query;
+    }
     if (route.split_k > 1 && route.query_tiles > 1) {
         query_tile = (n_query + route.query_tiles - 1u) / route.query_tiles;
     }
@@ -12261,6 +12267,13 @@ static bool ggml_vk_flash_attn_kvarn(
             planned_coop_query_pack = 6u;
         }
     }
+    const bool bodyless = (flags & 512u) != 0u;
+    // Prefill already keeps its body numerator and softmax statistics live
+    // across many 64-token tiles. Reuse that online loop for the exact tail:
+    // one tail partial avoids a workspace plane per candidate chunk and lets
+    // the whole query batch stay in one dispatch tile on RDNA3.
+    const bool coalesce_prefill_tail = use_coopmat && q->ne[1] > 8 &&
+        has_tail && !bodyless;
     GGML_ASSERT(q->ne[1] <= UINT16_MAX && gqa <= UINT16_MAX &&
         k_side.stream_start <= UINT16_MAX && k_side.groups_per_stream <= UINT16_MAX &&
         q->nb[0] == sizeof(float) &&
@@ -12279,14 +12292,16 @@ static bool ggml_vk_flash_attn_kvarn(
         use_coopmat ? 16u : (use_gqa6 ? 6u : 4u),
         use_coopmat && q->ne[1] <= 8,
         planned_coop_query_pack,
+        0u,
+        coalesce_prefill_tail,
     });
     GGML_ASSERT(route.workspace_supported &&
-        route.body_splits <= UINT16_MAX && route.tail_splits <= UINT8_MAX &&
+        route.body_splits <= 0x7fffu && route.tail_splits <= UINT8_MAX &&
         q->ne[1] <= UINT16_MAX && (!has_tail || tail_mask->ne[0] <= UINT16_MAX));
     const uint32_t packed_bits_and_splits =
         (k_side.bits & 0x0fu) |
         ((v_side.bits & 0x0fu) << 4u) |
-        (route.body_splits << 8u) |
+        ((route.body_splits | (coalesce_prefill_tail ? 0x8000u : 0u)) << 8u) |
         (route.tail_splits << 24u);
 
     const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
@@ -12299,7 +12314,6 @@ static bool ggml_vk_flash_attn_kvarn(
     const vk_subbuffer v_tail_buf = has_tail ?
         ggml_vk_tensor_subbuffer(ctx, v_tail) : q_buf;
     vk_subbuffer live_buf = q_buf;
-    const bool bodyless = (flags & 512u) != 0u;
     if (use_precomputed_live) {
         // Resolve the actual newest K/V cell once per stream.  The old native
         // shader repeated this full index scan in every body split and head
@@ -12444,13 +12458,17 @@ static bool ggml_vk_flash_attn_kvarn(
             std::max(1u, 16u / gqa), dispatch_query_tile) : 1u;
         coop_query_pack = std::min(
             planned_coop_query_pack, dispatch_query_tile);
+        if (coalesce_prefill_tail) {
+            coop_tail_query_pack = coop_query_pack;
+        }
     }
     const uint32_t dispatch_query_tiles =
         (uint32_t(q->ne[1]) + dispatch_query_tile - 1u) / dispatch_query_tile;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, dispatch_query_tiles);
     vk_pipeline tail_pipeline = nullptr;
     if (use_coopmat && route.tail_splits > 0) {
-        tail_pipeline = ctx->device->pipeline_kvarn_flash_attn_coop;
+        tail_pipeline = coalesce_prefill_tail ? pipeline :
+            ctx->device->pipeline_kvarn_flash_attn_coop;
         GGML_ASSERT(tail_pipeline != nullptr);
         ggml_pipeline_request_descriptor_sets(
             ctx, tail_pipeline, dispatch_query_tiles);
@@ -12520,6 +12538,7 @@ static bool ggml_vk_flash_attn_kvarn(
                  " body_splits=" << route.body_splits <<
                  " tail_splits=" << route.tail_splits <<
                  " max_tail_tokens_per_split=" << route.max_tail_tokens_per_split <<
+                 " tail_merge=" << (coalesce_prefill_tail ? "online" : "split64") <<
                  " query_pack=" << coop_query_pack <<
                  " query_tile=" << dispatch_query_tile <<
                  " query_tiles=" << dispatch_query_tiles <<

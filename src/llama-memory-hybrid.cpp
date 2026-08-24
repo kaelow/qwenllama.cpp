@@ -277,19 +277,27 @@ bool llama_memory_hybrid::state_seq_can_restore(llama_seq_id seq_id) const {
 
 bool llama_memory_hybrid::state_seq_can_save(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) {
+        return mem_recr->state_seq_can_save(seq_id, flags);
+    }
     return mem_attn->state_seq_can_save(seq_id, flags) &&
            mem_recr->state_seq_can_save(seq_id, flags);
 }
 
 bool llama_memory_hybrid::state_seq_can_restore(
         llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) {
+        return mem_recr->state_seq_can_restore(seq_id, flags);
+    }
     return mem_attn->state_seq_can_restore(seq_id, flags) &&
            mem_recr->state_seq_can_restore(seq_id, flags);
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    const bool include_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
-                              mem_attn->requires_state_for_partial_restore();
+    const bool recurrent_only = (flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) != 0;
+    const bool include_attn = !recurrent_only &&
+            ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
+             mem_attn->requires_state_for_partial_restore());
     if (include_attn) {
         mem_attn->state_write(io, seq_id, flags);
     }
@@ -297,8 +305,10 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    const bool include_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
-                              mem_attn->requires_state_for_partial_restore();
+    const bool recurrent_only = (flags & LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY) != 0;
+    const bool include_attn = !recurrent_only &&
+            ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
+             mem_attn->requires_state_for_partial_restore());
     if (include_attn) {
         mem_attn->state_read(io, seq_id, flags);
     }
