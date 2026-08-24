@@ -2,8 +2,13 @@
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_shuffle : enable
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+// One wave64 per workgroup on RDNA.  Each lane owns up to eight output
+// components, covering every supported head dimension through D512.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint HEAD_DIM = 512u;
+const uint HEAD_SLICES = HEAD_DIM / 64u;
 
 layout(binding = 0) readonly buffer Q       { uint  q_data[]; };
 layout(binding = 1) readonly buffer K       { uint  k_data[]; };
@@ -62,6 +67,12 @@ layout(push_constant) uniform parameter {
 #define TYPE_Q8_0 8u
 #define TYPE_IQ4_NL 20u
 #define TYPE_BF16 30u
+#define TYPE_Q6_0 43u
+#define TYPE_Q6_1 44u
+#define TYPE_Q3_0 45u
+#define TYPE_Q3_1 46u
+#define TYPE_Q2_0S 47u
+#define TYPE_Q2_1 48u
 
 const float IQ4_NL_VALUES[16] = float[16](
     -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
@@ -73,13 +84,38 @@ const float IQ4_NL_VALUES[16] = float[16](
 #define FLAG_BODYLESS     (1u << 19u)
 #define FLAG_MASK         (1u << 20u)
 #define FLAG_CURRENT_CONTIGUOUS (1u << 21u)
+#define FLAG_TAIL_ONLY_DISPATCH (1u << 22u)
 
 shared float reduce_data[128];
-shared float maximum;
-shared float denominator;
-shared float old_scale;
-shared float weight;
+shared float shared_maximum;
+shared float shared_denominator;
+shared float shared_old_scale;
+shared float shared_weight;
 shared int active_desc;
+
+uint tail_stride() {
+    return p.tail_mask_stride & 0x00ffffffu;
+}
+
+uint tail_splits() {
+    return p.tail_mask_stride >> 24u;
+}
+
+uint history_slot_count() {
+    return p.history_slots & 0xffffu;
+}
+
+uint body_splits() {
+    return p.history_slots >> 16u;
+}
+
+uint query_order_ne0() {
+    return p.query_order_ne0 & 0xffffu;
+}
+
+uint query_base() {
+    return p.query_order_ne0 >> 16u;
+}
 
 uint descriptor_offset(uint binding) {
     uint packed = binding < 2u ? p.descriptor_offsets_01 :
@@ -149,10 +185,52 @@ float load_body_k(uint base, uint dim) {
         const float d = fp16_bits(u16_at_k(off));
         const float m = affine ? fp16_bits(u16_at_k(off + 2u)) : 0.0;
         const uint qh_off = affine ? 4u : 2u;
-        const uint qh = k_data[(descriptor_offset(1u) + off + qh_off) >> 2u];
+        // q5_0 places qh immediately after the 2-byte scale, so it is not
+        // uint-aligned. Assemble it byte-wise instead of accidentally reading
+        // two scale bytes as the low half of the high-bit mask.
+        const uint qh = byte_at_k(off + qh_off + 0u) |
+            (byte_at_k(off + qh_off + 1u) << 8u) |
+            (byte_at_k(off + qh_off + 2u) << 16u) |
+            (byte_at_k(off + qh_off + 3u) << 24u);
         const uint packed = byte_at_k(off + qh_off + 4u + (iq & 15u));
         const uint q = ((packed >> (iq < 16u ? 0u : 4u)) & 15u) + (((qh >> iq) & 1u) << 4u);
         return affine ? d * float(q) + m : d * (float(q) - 16.0);
+    }
+    if (type == TYPE_Q6_0 || type == TYPE_Q6_1) {
+        const bool affine = type == TYPE_Q6_1;
+        const uint off = base + ib * (affine ? 28u : 26u);
+        const float d = fp16_bits(u16_at_k(off));
+        const float m = affine ? fp16_bits(u16_at_k(off + 2u)) : 0.0;
+        const uint qh_off = affine ? 4u : 2u;
+        const uint qh = byte_at_k(off + qh_off + (iq & 7u));
+        const uint packed = byte_at_k(off + qh_off + 8u + (iq & 15u));
+        const uint hshift = (((iq >> 3u) & 1u) * 4u) + (((iq >> 4u) & 1u) * 2u);
+        const uint q = ((packed >> (iq < 16u ? 0u : 4u)) & 15u) |
+            (((qh >> hshift) & 3u) << 4u);
+        return affine ? d * float(q) + m : d * (float(q) - 32.0);
+    }
+    if (type == TYPE_Q3_0 || type == TYPE_Q3_1) {
+        const bool affine = type == TYPE_Q3_1;
+        const uint off = base + ib * (affine ? 16u : 14u);
+        const float d = fp16_bits(u16_at_k(off));
+        const float m = affine ? fp16_bits(u16_at_k(off + 2u)) : 0.0;
+        const uint qh_off = affine ? 4u : 2u;
+        const uint qh = byte_at_k(off + qh_off + (iq >> 3u));
+        const uint packed = byte_at_k(off + qh_off + 4u + (iq & 7u));
+        const uint shift = 2u * ((iq >> 3u) & 1u) + (iq < 16u ? 0u : 4u);
+        const uint q = ((packed >> shift) & 3u) | (((qh >> (iq & 7u)) & 1u) << 2u);
+        return affine ? d * float(q) + m : d * (float(q) - 4.0);
+    }
+    if (type == TYPE_Q2_0S || type == TYPE_Q2_1) {
+        const bool affine = type == TYPE_Q2_1;
+        const uint off = base + ib * (affine ? 12u : 10u);
+        const float d = fp16_bits(u16_at_k(off));
+        const float m = affine ? fp16_bits(u16_at_k(off + 2u)) : 0.0;
+        const uint qs_off = affine ? 4u : 2u;
+        const uint packed = byte_at_k(off + qs_off + (iq & 7u));
+        const uint shift = 2u * ((iq >> 3u) & 1u) + (iq < 16u ? 0u : 4u);
+        const uint q = (packed >> shift) & 3u;
+        return affine ? d * float(q) + m : d * (float(q) - 2.0);
     }
     const uint off = base + ib * 34u;
     return fp16_bits(u16_at_k(off)) * float(signed_byte(byte_at_k(off + 2u + iq)));
@@ -190,10 +268,49 @@ float load_body_v(uint base, uint dim) {
         const float d = fp16_bits(u16_at_v(off));
         const float m = affine ? fp16_bits(u16_at_v(off + 2u)) : 0.0;
         const uint qh_off = affine ? 4u : 2u;
-        const uint qh = v_data[(descriptor_offset(2u) + off + qh_off) >> 2u];
+        const uint qh = byte_at_v(off + qh_off + 0u) |
+            (byte_at_v(off + qh_off + 1u) << 8u) |
+            (byte_at_v(off + qh_off + 2u) << 16u) |
+            (byte_at_v(off + qh_off + 3u) << 24u);
         const uint packed = byte_at_v(off + qh_off + 4u + (iq & 15u));
         const uint q = ((packed >> (iq < 16u ? 0u : 4u)) & 15u) + (((qh >> iq) & 1u) << 4u);
         return affine ? d * float(q) + m : d * (float(q) - 16.0);
+    }
+    if (type == TYPE_Q6_0 || type == TYPE_Q6_1) {
+        const bool affine = type == TYPE_Q6_1;
+        const uint off = base + ib * (affine ? 28u : 26u);
+        const float d = fp16_bits(u16_at_v(off));
+        const float m = affine ? fp16_bits(u16_at_v(off + 2u)) : 0.0;
+        const uint qh_off = affine ? 4u : 2u;
+        const uint qh = byte_at_v(off + qh_off + (iq & 7u));
+        const uint packed = byte_at_v(off + qh_off + 8u + (iq & 15u));
+        const uint hshift = (((iq >> 3u) & 1u) * 4u) + (((iq >> 4u) & 1u) * 2u);
+        const uint q = ((packed >> (iq < 16u ? 0u : 4u)) & 15u) |
+            (((qh >> hshift) & 3u) << 4u);
+        return affine ? d * float(q) + m : d * (float(q) - 32.0);
+    }
+    if (type == TYPE_Q3_0 || type == TYPE_Q3_1) {
+        const bool affine = type == TYPE_Q3_1;
+        const uint off = base + ib * (affine ? 16u : 14u);
+        const float d = fp16_bits(u16_at_v(off));
+        const float m = affine ? fp16_bits(u16_at_v(off + 2u)) : 0.0;
+        const uint qh_off = affine ? 4u : 2u;
+        const uint qh = byte_at_v(off + qh_off + (iq >> 3u));
+        const uint packed = byte_at_v(off + qh_off + 4u + (iq & 7u));
+        const uint shift = 2u * ((iq >> 3u) & 1u) + (iq < 16u ? 0u : 4u);
+        const uint q = ((packed >> shift) & 3u) | (((qh >> (iq & 7u)) & 1u) << 2u);
+        return affine ? d * float(q) + m : d * (float(q) - 4.0);
+    }
+    if (type == TYPE_Q2_0S || type == TYPE_Q2_1) {
+        const bool affine = type == TYPE_Q2_1;
+        const uint off = base + ib * (affine ? 12u : 10u);
+        const float d = fp16_bits(u16_at_v(off));
+        const float m = affine ? fp16_bits(u16_at_v(off + 2u)) : 0.0;
+        const uint qs_off = affine ? 4u : 2u;
+        const uint packed = byte_at_v(off + qs_off + (iq & 7u));
+        const uint shift = 2u * ((iq >> 3u) & 1u) + (iq < 16u ? 0u : 4u);
+        const uint q = (packed >> shift) & 3u;
+        return affine ? d * float(q) + m : d * (float(q) - 2.0);
     }
     const uint off = base + ib * 34u;
     return fp16_bits(u16_at_v(off)) * float(signed_byte(byte_at_v(off + 2u + iq)));
@@ -204,8 +321,9 @@ float load_half_word(uint word, uint half_index, bool bf16) {
     return bf16 ? bf16_bits(bits) : fp16_bits(bits);
 }
 float load_tail_k(uint slot, uint head, uint dim, uint stream) {
-    const bool current = (p.flags & FLAG_CURRENT) != 0u && slot >= p.history_slots;
-    const uint source_slot = current ? slot - p.history_slots : slot;
+    const uint history = history_slot_count();
+    const bool current = (p.flags & FLAG_CURRENT) != 0u && slot >= history;
+    const uint source_slot = current ? slot - history : slot;
     const uint tail_ne1 = p.kt_nb2 / p.kt_nb1;
     const uint half_index = (descriptor_offset(current ? 10u : 5u) >> 1u) +
         (current && (p.flags & FLAG_CURRENT_CONTIGUOUS) != 0u ?
@@ -216,8 +334,9 @@ float load_tail_k(uint slot, uint head, uint dim, uint stream) {
     return load_half_word(word, half_index, (p.flags & FLAG_TAIL_K_BF16) != 0u);
 }
 float load_tail_v(uint slot, uint head, uint dim, uint stream) {
-    const bool current = (p.flags & FLAG_CURRENT) != 0u && slot >= p.history_slots;
-    const uint source_slot = current ? slot - p.history_slots : slot;
+    const uint history = history_slot_count();
+    const bool current = (p.flags & FLAG_CURRENT) != 0u && slot >= history;
+    const uint source_slot = current ? slot - history : slot;
     const uint tail_ne1 = p.vt_nb2 / p.vt_nb1;
     const uint half_index = (descriptor_offset(current ? 11u : 6u) >> 1u) +
         (current && (p.flags & FLAG_CURRENT_CONTIGUOUS) != 0u ?
@@ -231,36 +350,90 @@ float load_mask_half(const uint data_word, uint half_index) {
     return load_half_word(data_word, half_index, false);
 }
 
-void accumulate_score(float partial, inout float acc[4], float values[4], float mask_value) {
+void accumulate_score(
+        float partial,
+        inout float acc[HEAD_SLICES],
+        float values[HEAD_SLICES],
+        float mask_value,
+        inout float maximum,
+        inout float denominator) {
     const uint lane = gl_LocalInvocationID.x;
-    reduce_data[lane] = partial;
-    barrier();
-    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) reduce_data[lane] += reduce_data[lane + stride];
-        barrier();
+    // Reduce inside each hardware subgroup first.  The old workgroup-wide
+    // shared-memory tree required eight workgroup barriers for every exact
+    // token, which dominated PP512 once the current 512 rows joined the
+    // retained 128-row tail.  Only subgroup leaders cross shared memory now.
+    for (uint stride = gl_SubgroupSize >> 1u; stride > 0u; stride >>= 1u) {
+        partial += subgroupShuffleXor(partial, stride);
     }
+
+    // RDNA executes this 64-lane workgroup as one wave.  Every lane has the
+    // same reduced score, so keep the online-softmax state replicated and do
+    // not cross shared memory at all.  The generic multi-subgroup branch below
+    // preserves correctness on wave32 and other Vulkan implementations.
+    if (gl_NumSubgroups == 1u) {
+        float score = partial * p.scale;
+        if (p.logit_softcap != 0.0) score = p.logit_softcap * tanh(score);
+        score += mask_value;
+        float lane_old_scale = 1.0;
+        float lane_weight = 0.0;
+        if (!(isinf(mask_value) && mask_value < 0.0)) {
+            const float next_max = max(maximum, score);
+            lane_old_scale = maximum < -3.0e38 ? 0.0 : exp(maximum - next_max);
+            lane_weight = exp(score - next_max);
+            maximum = next_max;
+            denominator = denominator * lane_old_scale + lane_weight;
+        }
+        for (uint i = 0u; i < HEAD_SLICES; ++i) {
+            acc[i] = acc[i] * lane_old_scale + values[i] * lane_weight;
+        }
+        return;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        reduce_data[gl_SubgroupID] = partial;
+    }
+    barrier();
     if (lane == 0u) {
-        float score = reduce_data[0] * p.scale;
+        float score = 0.0;
+        for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+            score += reduce_data[subgroup];
+        }
+        score *= p.scale;
         if (p.logit_softcap != 0.0) score = p.logit_softcap * tanh(score);
         score += mask_value;
         if (isinf(mask_value) && mask_value < 0.0) {
-            old_scale = 1.0;
-            weight = 0.0;
+            shared_old_scale = 1.0;
+            shared_weight = 0.0;
+            shared_maximum = maximum;
+            shared_denominator = denominator;
         } else {
             const float next_max = max(maximum, score);
-            old_scale = maximum < -3.0e38 ? 0.0 : exp(maximum - next_max);
-            weight = exp(score - next_max);
-            maximum = next_max;
-            denominator = denominator * old_scale + weight;
+            shared_old_scale = maximum < -3.0e38 ? 0.0 : exp(maximum - next_max);
+            shared_weight = exp(score - next_max);
+            shared_maximum = next_max;
+            shared_denominator = denominator * shared_old_scale + shared_weight;
         }
     }
     barrier();
-    for (uint i = 0u; i < 4u; ++i) acc[i] = acc[i] * old_scale + values[i] * weight;
+    maximum = shared_maximum;
+    denominator = shared_denominator;
+    for (uint i = 0u; i < HEAD_SLICES; ++i) {
+        acc[i] = acc[i] * shared_old_scale + values[i] * shared_weight;
+    }
 }
 
 void main() {
     const uint lane = gl_LocalInvocationID.x;
-    const uint query = gl_WorkGroupID.x;
+    const uint n_body_splits = body_splits();
+    const uint n_tail_splits = tail_splits();
+    const uint split_count = n_body_splits + n_tail_splits;
+    const bool tail_only_dispatch = (p.flags & FLAG_TAIL_ONLY_DISPATCH) != 0u;
+    const uint dispatched_splits = tail_only_dispatch ? n_tail_splits : split_count;
+    const uint local_query = gl_WorkGroupID.x / dispatched_splits;
+    const uint query = query_base() + local_query;
+    const uint split_index = tail_only_dispatch ?
+        n_body_splits + gl_WorkGroupID.x % dispatched_splits :
+        gl_WorkGroupID.x % split_count;
     const uint query_head = gl_WorkGroupID.y;
     const uint stream = gl_WorkGroupID.z;
     const uint n_q_heads = p.heads & 0xffffu;
@@ -271,13 +444,11 @@ void main() {
         stream * p.head_dim * p.n_query * n_q_heads * 4u;
 
     if (lane == 0u) {
-        maximum = -3.402823466e38;
-        denominator = 0.0;
         active_desc = -1;
         const int query_id = int(stream * p.n_query + query);
         for (uint packed = 0u; packed < p.query_order_elements; ++packed) {
             if (qorder_data[(descriptor_offset(8u) >> 2u) + packed] == query_id) {
-                active_desc = int(packed / p.query_order_ne0);
+                active_desc = int(packed / query_order_ne0());
                 break;
             }
         }
@@ -285,7 +456,12 @@ void main() {
     barrier();
     if (active_desc < 0) return;
 
-    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    float maximum = -3.402823466e38;
+    float denominator = 0.0;
+    float acc[HEAD_SLICES];
+    for (uint slice = 0u; slice < HEAD_SLICES; ++slice) {
+        acc[slice] = 0.0;
+    }
     const uint mask_stream = mask_streams == 1u ? 0u : stream;
     uint n_head_log2 = 1u;
     while ((n_head_log2 << 1u) <= n_q_heads) n_head_log2 <<= 1u;
@@ -294,18 +470,25 @@ void main() {
     const float slope = p.max_bias > 0.0 ?
         (query_head < n_head_log2 ? pow(m0, float(query_head + 1u)) :
          pow(m1, float(2u * (query_head - n_head_log2) + 1u))) : 1.0;
-    if ((p.flags & FLAG_BODYLESS) == 0u) {
-        for (uint token = 0u; token < p.n_kv; ++token) {
+    const bool process_body = (p.flags & FLAG_BODYLESS) == 0u &&
+        split_index < n_body_splits;
+    const uint body_divisor = max(n_body_splits, 1u);
+    const bool small_query = p.n_query <= 8u;
+    const uint body_begin = process_body ? (small_query ?
+        split_index * 64u : p.n_kv * split_index / body_divisor) : 0u;
+    const uint body_end = process_body ? (small_query ?
+        min(body_begin + 64u, p.n_kv) :
+        p.n_kv * (split_index + 1u) / body_divisor) : 0u;
+    if (process_body) {
+        for (uint token = body_begin; token < body_end; ++token) {
             const uint k_base = token * p.k_nb1 + kv_head * p.k_nb2 + stream * p.k_nb3;
             const uint v_base = token * p.v_nb1 + kv_head * p.v_nb2 + stream * p.v_nb3;
             float partial = 0.0;
-            float values[4] = float[4](0.0, 0.0, 0.0, 0.0);
-            for (uint slice = 0u; slice < 4u; ++slice) {
-                const uint dim = lane + slice * 128u;
-                if (dim < p.head_dim) {
-                    partial += uintBitsToFloat(q_data[(q_base + dim * 4u) >> 2u]) * load_body_k(k_base, dim);
-                    values[slice] = load_body_v(v_base, dim);
-                }
+            float values[HEAD_SLICES];
+            for (uint slice = 0u; slice < HEAD_SLICES; ++slice) {
+                const uint dim = lane + slice * 64u;
+                partial += uintBitsToFloat(q_data[(q_base + dim * 4u) >> 2u]) * load_body_k(k_base, dim);
+                values[slice] = load_body_v(v_base, dim);
             }
             const uint mask_index = token + query * p.n_kv +
                 mask_stream * p.n_kv * p.n_query;
@@ -313,41 +496,50 @@ void main() {
                 slope * load_mask_half(
                     mask_data[((descriptor_offset(3u) >> 1u) + mask_index) >> 1u],
                     (descriptor_offset(3u) >> 1u) + mask_index) : 0.0;
-            accumulate_score(partial, acc, values, mask_value);
+            accumulate_score(partial, acc, values, mask_value, maximum, denominator);
         }
     }
 
     const uint desc_base = uint(active_desc) * p.run_desc_ne0;
     const uint run_offset = descriptor_offset(9u) >> 2u;
     const uint n_tail = uint(max(run_data[run_offset + desc_base + 4u], 0));
-    for (uint token = 0u; token < n_tail; ++token) {
+    const bool process_tail = split_index >= n_body_splits &&
+        split_index < n_body_splits + n_tail_splits;
+    const uint tail_split = process_tail ? split_index - n_body_splits : 0u;
+    const uint tail_begin = process_tail ? tail_split * 64u : 0u;
+    const uint tail_end = process_tail ? min(tail_begin + 64u, n_tail) : 0u;
+    for (uint token = tail_begin; token < tail_end; ++token) {
         const uint slot = uint(run_data[run_offset + desc_base + 6u + token]);
         float partial = 0.0;
-        float values[4] = float[4](0.0, 0.0, 0.0, 0.0);
-        for (uint slice = 0u; slice < 4u; ++slice) {
-            const uint dim = lane + slice * 128u;
-            if (dim < p.head_dim) {
-                partial += uintBitsToFloat(q_data[(q_base + dim * 4u) >> 2u]) *
-                    load_tail_k(slot, kv_head, dim, stream);
-                values[slice] = load_tail_v(slot, kv_head, dim, stream);
-            }
+        float values[HEAD_SLICES];
+        for (uint slice = 0u; slice < HEAD_SLICES; ++slice) {
+            const uint dim = lane + slice * 64u;
+            partial += uintBitsToFloat(q_data[(q_base + dim * 4u) >> 2u]) *
+                load_tail_k(slot, kv_head, dim, stream);
+            values[slice] = load_tail_v(slot, kv_head, dim, stream);
         }
-        const uint mask_index = token + query * p.tail_mask_stride +
-            stream * p.tail_mask_stride * p.n_query;
+        const uint mask_index = token + query * tail_stride() +
+            stream * tail_stride() * p.n_query;
         const uint tmask_index = (descriptor_offset(7u) >> 1u) + mask_index;
         const float mask_value = slope * load_mask_half(tmask_data[tmask_index >> 1u], tmask_index);
-        accumulate_score(partial, acc, values, mask_value);
+        accumulate_score(partial, acc, values, mask_value, maximum, denominator);
     }
 
-    if (lane == 0u) {
-        old_scale = 1.0;
-        weight = denominator > 0.0 ? 1.0 / denominator : 0.0;
+    const uint tile_queries = gl_NumWorkGroups.x / dispatched_splits;
+    const uint matrix_values = p.head_dim * tile_queries * n_q_heads *
+        (p.streams & 0xffffu) * split_count;
+    const uint out_base = (descriptor_offset(4u) >> 2u) + p.head_dim * n_q_heads *
+        (split_index + split_count * (local_query + tile_queries * stream)) +
+        p.head_dim * query_head;
+    for (uint slice = 0u; slice < HEAD_SLICES; ++slice) {
+        const uint dim = lane + slice * 64u;
+        out_data[out_base + dim] = floatBitsToUint(acc[slice]);
     }
-    barrier();
-    const uint out_base = (descriptor_offset(4u) >> 2u) +
-        p.head_dim * (query_head + n_q_heads * (query + p.n_query * stream));
-    for (uint slice = 0u; slice < 4u; ++slice) {
-        const uint dim = lane + slice * 128u;
-        if (dim < p.head_dim) out_data[out_base + dim] = floatBitsToUint(acc[slice] * old_scale * weight);
+    if (lane == 0u) {
+        const uint lm_base = (descriptor_offset(4u) >> 2u) + matrix_values +
+            n_q_heads * 2u * (split_index + split_count *
+                (local_query + tile_queries * stream));
+        out_data[lm_base + query_head] = floatBitsToUint(denominator);
+        out_data[lm_base + n_q_heads + query_head] = floatBitsToUint(maximum);
     }
 }

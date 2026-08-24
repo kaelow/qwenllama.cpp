@@ -10505,6 +10505,52 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 2, true, false, 0, 0,
             GGML_PREC_F32, body_types.first, body_types.second, {0, 1, 2, 3}, 64, false, GGML_TYPE_BF16));
     }
+    // Vulkan segmented-tail boundaries.  These rows prove that exact tokens
+    // stay in independent 64-token partials, including a secondary tail-1024
+    // scaling case, while a native q6 body remains device-resident.
+    for (int64_t n_tail : { 1, 63, 64, 127, 128, 129, 1024 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+            128, 128, 4, {2, 1}, 129, 2, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q6_0, GGML_TYPE_Q6_1,
+            {0, 1, 2, 3}, n_tail, false, GGML_TYPE_F16));
+    }
+    // Qwen3.5/Qwen3.8-shaped q5 overlay regression.  The production failure
+    // appeared as coherent but repetitive output, so exercise both decode and
+    // a short verification cohort at D256/GQA with the default BF16 tail.
+    for (int64_t n_query : { 1, 8 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+            256, 256, 4, {8, 1}, 4096, n_query, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0,
+            {0, 1, 2, 3}, 128, false, GGML_TYPE_BF16));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(
+        256, 256, 4, {8, 1}, 4096, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q6_1, GGML_TYPE_Q6_0,
+        {0, 1, 2, 3}, 128, false, GGML_TYPE_BF16));
+    // Vulkan native FA coverage for Bee's standard cache quants. Keep these
+    // independent from the exact-tail composite so a host/scheduler fallback
+    // cannot hide a missing body pipeline. Every ordered K/V pair is covered
+    // at decode geometry; symmetric families additionally cover short verify
+    // and prompt-query shapes at D128/D256/D512.
+    const ggml_type bee_cache_types[] = {
+        GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1,
+        GGML_TYPE_Q3_0,  GGML_TYPE_Q3_1,
+        GGML_TYPE_Q6_0,  GGML_TYPE_Q6_1,
+    };
+    for (ggml_type type_k : bee_cache_types) {
+        for (ggml_type type_v : bee_cache_types) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                128, 128, 2, {2, 1}, 129, 1, true, false, 0, 0,
+                GGML_PREC_F32, type_k, type_v));
+        }
+        for (int64_t head_dim : { 128, 256, 512 }) {
+            for (int64_t n_query : { 2, 8, 512 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                    head_dim, head_dim, 1, {1, 1}, 129, n_query,
+                    true, false, 0, 0, GGML_PREC_F32, type_k, type_k));
+            }
+        }
+    }
     // Qwen3.6 geometry: 24 query heads over 4 KV heads with 256-wide K/V.
     // Cover both the smallest tail and a full query-specific prefill tail.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 2, true, false, 0, 0,

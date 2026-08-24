@@ -1683,6 +1683,13 @@ struct test {
     uint64_t                 kvarn_route_direct = 0;
     uint64_t                 kvarn_route_compact_tail = 0;
     uint64_t                 kvarn_route_generic_rejected = 0;
+    uint64_t                 kvarn_fast_path = 0;
+    uint64_t                 kvarn_fallback_flags = 0;
+    uint64_t                 kvarn_body_splits_max = 0;
+    uint64_t                 kvarn_tail_splits_max = 0;
+    uint64_t                 kvarn_tail_rows_max = 0;
+    uint64_t                 kvarn_query_tile_min = 0;
+    uint64_t                 kvarn_query_tiles_max = 0;
     uint64_t                 kvarn_route_unified_partial = 0;
     uint64_t                 kvarn_geometry_candidates = 0;
     uint64_t                 kvarn_geometry_split_8 = 0;
@@ -1873,7 +1880,9 @@ struct test {
             "kvarn_route_families", "kvarn_route_portable", "kvarn_route_amd_generic",
             "kvarn_route_amd_split", "kvarn_route_amd_vector", "kvarn_route_materialize",
             "kvarn_route_split_reduce", "kvarn_route_direct", "kvarn_route_compact_tail",
-            "kvarn_route_generic_rejected", "kvarn_route_unified_partial",
+            "kvarn_route_generic_rejected", "kvarn_fast_path", "kvarn_fallback_flags",
+            "kvarn_body_splits_max", "kvarn_tail_splits_max", "kvarn_tail_rows_max",
+            "kvarn_query_tile_min", "kvarn_query_tiles_max", "kvarn_route_unified_partial",
             "kvarn_geometry_candidates", "kvarn_geometry_split_8", "kvarn_geometry_split_16",
             "kvarn_geometry_split_32", "kvarn_geometry_split_64", "kvarn_geometry_candidate_mask",
             "kvarn_capability_key", "kvarn_capability_subgroup_width", "kvarn_capability_compute_units",
@@ -2014,6 +2023,13 @@ struct test {
                                              std::to_string(kvarn_route_direct),
                                              std::to_string(kvarn_route_compact_tail),
                                              std::to_string(kvarn_route_generic_rejected),
+                                             std::to_string(kvarn_fast_path),
+                                             std::to_string(kvarn_fallback_flags),
+                                             std::to_string(kvarn_body_splits_max),
+                                             std::to_string(kvarn_tail_splits_max),
+                                             std::to_string(kvarn_tail_rows_max),
+                                             std::to_string(kvarn_query_tile_min),
+                                             std::to_string(kvarn_query_tiles_max),
                                              std::to_string(kvarn_route_unified_partial),
                                              std::to_string(kvarn_geometry_candidates),
                                              std::to_string(kvarn_geometry_split_8),
@@ -2879,7 +2895,7 @@ int llama_bench(int argc, char ** argv) {
         ggml_backend_dev_t memory_dev = bench_memory_device(inst);
         const char * memory_device_name = memory_dev != nullptr ? ggml_backend_dev_name(memory_dev) : nullptr;
         const uint32_t route_stats_abi_version = memory_device_name != nullptr &&
-            strncmp(memory_device_name, "Vulkan", 6) == 0 ? 1u : 3u;
+            strncmp(memory_device_name, "Vulkan", 6) == 0 ? 2u : 3u;
         ggml_backend_reg_t memory_reg =
             memory_dev != nullptr ? ggml_backend_dev_backend_reg(memory_dev) : nullptr;
         auto kvarn_route_stats_reset = memory_reg != nullptr ?
@@ -3176,7 +3192,19 @@ int llama_bench(int argc, char ** argv) {
             t.kvarn_route_split_reduce = stats.split_reduce;
             t.kvarn_route_direct = stats.direct_entry;
             t.kvarn_route_compact_tail = stats.compact_tail_entry;
-            t.kvarn_route_generic_rejected = stats.generic_shape_rejected;
+            if (route_stats_abi_version == 2) {
+                // Vulkan ABI v2 reuses the post-v1 extension slots so one
+                // caller structure remains compatible with CUDA ABI v3.
+                t.kvarn_fast_path = stats.generic_shape_rejected;
+                t.kvarn_fallback_flags = stats.unified_body_exact_partial;
+                t.kvarn_body_splits_max = stats.geometry_candidates;
+                t.kvarn_tail_splits_max = stats.geometry_split_8;
+                t.kvarn_tail_rows_max = stats.geometry_split_16;
+                t.kvarn_query_tile_min = stats.geometry_split_32;
+                t.kvarn_query_tiles_max = stats.geometry_split_64;
+            } else {
+                t.kvarn_route_generic_rejected = stats.generic_shape_rejected;
+            }
             if (route_stats_abi_version >= 3) {
                 t.kvarn_route_unified_partial = stats.unified_body_exact_partial;
                 t.kvarn_geometry_candidates = stats.geometry_candidates;

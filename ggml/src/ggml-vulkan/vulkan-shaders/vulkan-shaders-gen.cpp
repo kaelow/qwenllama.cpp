@@ -1050,6 +1050,42 @@ void process_shaders() {
     string_to_spv("kvarn_store", "kvarn_store.comp", {});
     string_to_spv("kvarn_materialize", "kvarn_materialize.comp", {});
     string_to_spv("kvarn_flash_attn", "kvarn_flash_attn.comp", {});
+    string_to_spv("kvarn_flash_attn_gqa6", "kvarn_flash_attn.comp",
+            {{"KVAR_GQA_GROUP_MAX", "6"}});
+    string_to_spv("kvarn_flash_attn_precomputed", "kvarn_flash_attn.comp",
+            {{"KVAR_PRECOMPUTED_LIVE", "1"}});
+    string_to_spv("kvarn_flash_attn_precomputed_gqa6", "kvarn_flash_attn.comp",
+            {{"KVAR_PRECOMPUTED_LIVE", "1"}, {"KVAR_GQA_GROUP_MAX", "6"}});
+    string_to_spv("kvarn_flash_attn_precomputed_gqa16", "kvarn_flash_attn.comp",
+            {{"KVAR_PRECOMPUTED_LIVE", "1"}, {"KVAR_GQA_GROUP_MAX", "16"}});
+    string_to_spv("kvarn_flash_attn_record_tile", "kvarn_flash_attn.comp",
+            {{"KVAR_RECORD_TILE", "1"}});
+    string_to_spv("kvarn_flash_attn_record_tile_gqa6", "kvarn_flash_attn.comp",
+            {{"KVAR_RECORD_TILE", "1"}, {"KVAR_GQA_GROUP_MAX", "6"}});
+    string_to_spv("kvarn_flash_attn_record_tile_precomputed", "kvarn_flash_attn.comp",
+            {{"KVAR_RECORD_TILE", "1"}, {"KVAR_PRECOMPUTED_LIVE", "1"}});
+    string_to_spv("kvarn_flash_attn_record_tile_precomputed_gqa6", "kvarn_flash_attn.comp",
+            {{"KVAR_RECORD_TILE", "1"}, {"KVAR_PRECOMPUTED_LIVE", "1"},
+             {"KVAR_GQA_GROUP_MAX", "6"}});
+    string_to_spv("kvarn_flash_attn_tiled_wave64", "kvarn_flash_attn.comp",
+            {{"KVAR_TILED_WAVE64", "1"}});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("kvarn_flash_attn_coop", "kvarn_flash_attn.comp",
+            {{"KVAR_COOPMAT", "1"}, {"KVAR_PRECOMPUTED_LIVE", "1"},
+             {"KVAR_GQA_GROUP_MAX", "16"}}, true, true);
+    string_to_spv("kvarn_flash_attn_coop_prefill", "kvarn_flash_attn.comp",
+            {{"KVAR_COOPMAT", "1"}, {"KVAR_COOPMAT_PREFILL", "1"},
+             {"KVAR_PRECOMPUTED_LIVE", "1"}, {"KVAR_GQA_GROUP_MAX", "16"}},
+            true, true);
+    string_to_spv("kvarn_flash_attn_coop_prefill_d256", "kvarn_flash_attn.comp",
+            {{"KVAR_COOPMAT", "1"}, {"KVAR_COOPMAT_PREFILL", "1"},
+             {"KVAR_PRECOMPUTED_LIVE", "1"}, {"KVAR_GQA_GROUP_MAX", "16"},
+             {"KVAR_HEAD_DIM", "256"}, {"KVAR_COOPMAT_DIM_BLOCKS", "16"},
+             {"KVAR_COOPMAT_MATRIX_BATCHES", "3"},
+             {"KVAR_COOPMAT_MAX_HEAD_DIM", "256"},
+             {"KVAR_COOPMAT_MAX_HEAD_SLICES", "2"}},
+            true, true);
+#endif
     string_to_spv("flash_attn_tail", "flash_attn_tail.comp", {});
     string_to_spv("kvarn_wht", "kvarn_wht.comp", {});
     string_to_spv("kvarn_wht_d256", "kvarn_wht_parallel.comp", {{"HEAD_WIDTH", "256"}});

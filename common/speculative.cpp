@@ -2497,6 +2497,7 @@ common_speculative_init_result::common_speculative_init_result(
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
+    cparams.kv_tail_rollback_tokens = 0;
     cparams.ctx_other = ctx_tgt;
     cparams.kv_tail_tokens = 0;
     cparams.kv_tail_type   = GGML_TYPE_F16;
@@ -3067,6 +3068,16 @@ bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     }
     common_speculative_state_restore_plan_commit(plan.get());
     return true;
+}
+
+common_speculative_type common_speculative_last_type(
+        const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 ||
+            size_t(seq_id) >= spec->impl_last.size() ||
+            spec->impl_last[seq_id] == nullptr) {
+        return COMMON_SPECULATIVE_TYPE_NONE;
+    }
+    return spec->impl_last[seq_id]->type;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

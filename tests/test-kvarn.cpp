@@ -135,6 +135,13 @@ static void test_vulkan_decode_route_policy() {
             "Vulkan KVarN decode must reuse each KV reconstruction across GQA heads");
     require(decode.workgroups_y == 8,
             "Vulkan KVarN grouped-GQA workgroup count is incorrect");
+
+    const auto decode_gqa6 = ggml_vk_fattn_kvarn_plan({
+        16384, 1, 24, 4, 1, 82, 0, 256,
+        128ull * 1024ull * 1024ull, 6,
+    });
+    require(decode_gqa6.gqa_group_size == 6 && decode_gqa6.workgroups_y == 4,
+            "Vulkan KVarN GQA=6 specialization must avoid duplicate K/V groups");
     require(decode.split_k > 1,
             "long-context Vulkan KVarN decode must use split-K occupancy");
 
@@ -151,6 +158,41 @@ static void test_vulkan_decode_route_policy() {
     });
     require(populated.split_k == 1,
             "well-populated Vulkan verification must avoid unnecessary split reduction");
+
+    for (uint32_t tail : { 1u, 63u, 64u, 127u, 128u, 129u, 1024u }) {
+        const auto exact_tail = ggml_vk_fattn_kvarn_plan({
+            0, 512, 48, 8, 1, 96, tail, 128,
+        });
+        require(exact_tail.workspace_supported,
+                "Vulkan exact-tail query tiling rejected a supported shape");
+        require(exact_tail.tail_splits == (tail + 63u) / 64u,
+                "Vulkan exact tail was not divided into 64-token chunks");
+        require(exact_tail.max_tail_tokens_per_split <= 64u,
+                "Vulkan exact-tail split exceeds 64 rows");
+        require(exact_tail.workspace_bytes <= 128ull * 1024ull * 1024ull,
+                "Vulkan exact-tail planner exceeded its transient workspace budget");
+    }
+
+    const auto tiled_prefill = ggml_vk_fattn_kvarn_plan({
+        20000, 512, 48, 8, 1, 96, 1024, 128,
+    });
+    require(tiled_prefill.tail_splits == 16 &&
+            tiled_prefill.max_tail_tokens_per_split == 64,
+            "tail-1024 prefill must retain sixteen independent exact chunks");
+    require(tiled_prefill.query_tiles > 1 && tiled_prefill.query_tile < 512,
+            "workspace-bound PP512 must tile queries instead of merging tail chunks");
+    require(tiled_prefill.workspace_bytes <= 128ull * 1024ull * 1024ull,
+            "query-tiled PP512 exceeded the 128 MiB transient budget");
+
+    const auto packed_small_prefill = ggml_vk_fattn_kvarn_plan({
+        19488, 64, 24, 4, 1, 96, 128, 256,
+        128ull * 1024ull * 1024ull, 16, false, 6,
+    });
+    require(packed_small_prefill.body_splits >= 5,
+            "packed cooperative queries under-filled the RDNA3 split planner");
+    require(packed_small_prefill.workspace_supported &&
+            packed_small_prefill.workspace_bytes <= 128ull * 1024ull * 1024ull,
+            "packed cooperative-query occupancy exceeded the workspace budget");
 }
 
 static void set_test_env(const char * name, const char * value) {
@@ -923,7 +965,11 @@ static void test_kvarn_wht_op(
     const double rmse = std::sqrt(mse / double(got.size()));
     const double tolerance = input_type == GGML_TYPE_F32 ? 2e-5 :
         (input_type == GGML_TYPE_F16 ? 2e-3 : 2e-2);
-    if (!std::isfinite(rmse) || rmse > tolerance || max_diff > 4*tolerance) {
+    // The normalized transform has coherent outputs above 16 for this input,
+    // where one representable FP16 step is 0.015625. Keep the tighter RMSE
+    // guard, but allow one output ULP for an individual FP16 element.
+    const double max_tolerance = input_type == GGML_TYPE_F16 ? 8*tolerance : 4*tolerance;
+    if (!std::isfinite(rmse) || rmse > tolerance || max_diff > max_tolerance) {
         std::fprintf(stderr, "KVarN WHT: head_width=%d type=%s rmse=%g max_diff=%g\n",
                 head_width, ggml_type_name(input_type), rmse, max_diff);
         require(false, "KVarN WHT output mismatch");
@@ -1205,8 +1251,16 @@ static void test_cache_ops(
     ggml_backend_tensor_get(stored, stage_probe.data(), 0, stage_probe.size()*sizeof(ggml_fp16_t));
     std::vector<float> rotated_probe(input.begin(), input.begin() + n_heads*128);
     apply_reference_kvarn_wht_head(rotated_probe.data(), n_heads*128);
-    require(std::abs(ggml_fp16_to_fp32(stage_probe[0]) - rotated_probe[0]) < 0.01f,
-            "KVarN stage did not retain rotated-domain rows");
+    const float stage_first = ggml_fp16_to_fp32(stage_probe[0]);
+    // This coherent D512 transform can exceed 22, where one FP16 ULP is
+    // 0.015625. The stage is intentionally FP16, so allow one stored ULP.
+    if (std::abs(stage_first - rotated_probe[0]) >= 0.02f) {
+        std::fprintf(stderr,
+                "KVarN stage mismatch: backend=%s bits=%d head_slices=%d actual=%g expected=%g input=%g\n",
+                ggml_backend_name(backend), bits, head_slices,
+                stage_first, rotated_probe[0], input[0]);
+        require(false, "KVarN stage did not retain rotated-domain rows");
+    }
 
     const std::vector<float> output = test_kvarn_reference_decode_f32(
             records, stored, idx, n_tokens, 0, 1, bits, false, 3, false, false, head_slices);
@@ -3051,12 +3105,12 @@ static void test_native_flash_attention_gpu() {
     const char * actual_backend = gpu_device ? ggml_backend_dev_name(gpu_device) : nullptr;
     const bool expect_vulkan_route_stats = actual_backend != nullptr &&
         std::strncmp(actual_backend, "Vulkan", 6) == 0;
-    const uint32_t route_stats_abi_version = expect_vulkan_route_stats ? 1u : 3u;
+    const uint32_t route_stats_abi_version = expect_vulkan_route_stats ? 2u : 3u;
     bool hip_safe_first = false;
     int hip_physical_wave_size = 0;
     require(!expect_vulkan_route_stats ||
             (route_stats_reset != nullptr && route_stats_get != nullptr),
-            "Vulkan KVarN backend omitted ABI-v1 route telemetry");
+            "Vulkan KVarN backend omitted ABI-v2 route telemetry");
     if (expect_vulkan_route_stats) {
         ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -3097,7 +3151,7 @@ static void test_native_flash_attention_gpu() {
         route_stats_get(nullptr);
         test_kvarn_route_stats undersized = make_test_kvarn_route_stats(route_stats_abi_version);
         undersized.struct_size = expect_vulkan_route_stats ?
-            offsetof(test_kvarn_route_stats, compact_tail_entry) :
+            offsetof(test_kvarn_route_stats, geometry_split_64) :
             sizeof(undersized) - sizeof(undersized.generic_shape_rejected);
         undersized.route_families = 0xa5a5a5a5u;
         route_stats_get(&undersized);
@@ -3109,6 +3163,14 @@ static void test_native_flash_attention_gpu() {
         route_stats_get(&wrong_version);
         require(wrong_version.route_families == 0x5a5a5a5au,
                 "KVarN route telemetry wrote a caller structure with an unsupported ABI version");
+        if (expect_vulkan_route_stats) {
+            test_kvarn_route_stats legacy = make_test_kvarn_route_stats(1);
+            legacy.struct_size = offsetof(test_kvarn_route_stats, generic_shape_rejected);
+            legacy.route_families = 0;
+            route_stats_get(&legacy);
+            require((legacy.route_families & 1u) != 0 && legacy.abi_version == 1,
+                    "Vulkan route telemetry broke its ABI-v1 prefix reader");
+        }
         route_stats_reset();
         ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -3285,6 +3347,23 @@ static void test_native_flash_attention_gpu() {
                 "portable-only KVarN backend did not report its compact body-plus-current-tail entry");
         require(route_capabilities.materialize_fallback == 0,
                 "portable-only compact KVarN tail unexpectedly materialized");
+        if (expect_vulkan_route_stats) {
+            // Vulkan ABI-v2 aliases its suffix onto the shared CUDA-v3 caller
+            // slots: generic_shape_rejected=fast path, unified=fall-back flags,
+            // geometry candidates/body, split8/tail, split16/max tail rows,
+            // split32/min query tile, and split64/max query tiles.
+            require((route_capabilities.generic_shape_rejected & 1u) != 0,
+                    "Vulkan route telemetry did not select record-split attention");
+            require(route_capabilities.unified_body_exact_partial == 0,
+                    "Vulkan native attention reported an unexpected fallback reason");
+            require(route_capabilities.geometry_candidates > 0,
+                    "Vulkan route telemetry omitted body split counts");
+            require(route_capabilities.geometry_split_16 <= 64,
+                    "Vulkan route telemetry observed an oversized exact-tail split");
+            require(route_capabilities.geometry_split_32 > 0 &&
+                    route_capabilities.geometry_split_64 > 0,
+                    "Vulkan route telemetry omitted query tile statistics");
+        }
         ggml_backend_free(cpu_backend);
         ggml_backend_free(gpu_backend);
         return;
@@ -3951,8 +4030,14 @@ static void test_rotated_decode_transform_consistency(enum ggml_backend_dev_type
         }
     }
     const double rmse = std::sqrt(sum_sq / std::max<size_t>(count, 1));
-    require(rmse <= 5e-4, "rotated decode inverse-WHT RMSE too high");
-    require(max_diff <= 2e-3, "rotated decode inverse-WHT max error too high");
+    // This comparison crosses two FP16-domain transforms. Preserve the tight
+    // aggregate accuracy check while allowing an isolated rounded element.
+    if (rmse > 5e-4 || max_diff > 4e-3) {
+        std::fprintf(stderr, "rotated decode inverse-WHT mismatch: backend=%s rmse=%g max_diff=%g\n",
+                ggml_backend_name(backend), rmse, max_diff);
+        require(rmse <= 5e-4, "rotated decode inverse-WHT RMSE too high");
+        require(max_diff <= 4e-3, "rotated decode inverse-WHT max error too high");
+    }
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);

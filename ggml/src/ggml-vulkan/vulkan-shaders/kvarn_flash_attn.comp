@@ -4,8 +4,55 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_basic : enable
+#ifdef KVAR_COOPMAT
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#endif
 
+#if defined(KVAR_TILED_WAVE64) || defined(KVAR_COOPMAT)
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+#ifndef KVAR_COOPMAT_MATRIX_BATCHES
+#define KVAR_COOPMAT_MATRIX_BATCHES 2
+#endif
+#ifndef KVAR_COOPMAT_MAX_HEAD_DIM
+#define KVAR_COOPMAT_MAX_HEAD_DIM 512
+#endif
+#ifndef KVAR_COOPMAT_MAX_HEAD_SLICES
+#define KVAR_COOPMAT_MAX_HEAD_SLICES 4
+#endif
+
+#ifdef KVAR_COOPMAT
+// One workgroup owns one 64-token split and one KV head.  Query rows are the
+// GQA heads (padded to the native 16x16x16 KHR cooperative-matrix shape).
+// Stage only the current 16-wide query slice instead of a full D512 matrix;
+// after QK the same allocation holds the 64x16 probability tile. Prefill has
+// several probability planes so one reconstructed K/V tile can serve several
+// matrix batches. Scores and PV products are lifetime-disjoint and share one FP32
+// matrix. Keeping D256 LDS below 16 KiB is important on RDNA3's 32 KiB
+// workgroup-memory devices: it permits two resident workgroups per CU.
+#ifdef KVAR_COOPMAT_PREFILL
+shared float16_t sh_cm_q_or_p[KVAR_COOPMAT_MATRIX_BATCHES * 64 * 16];
+#else
+shared float16_t sh_cm_q_or_p[64u * 16u];
+#endif
+shared float16_t sh_cm_tile[64u * 16u];
+shared float sh_cm_score_or_pv[4u * 16u * 16u];
+shared float16_t sh_cm_dim_axes[3 * KVAR_COOPMAT_MAX_HEAD_DIM];
+shared float16_t sh_cm_token_axes[3 * KVAR_COOPMAT_MAX_HEAD_SLICES * 64];
+shared uint sh_cm_tail_slot[64u];
+#ifdef KVAR_COOPMAT_PREFILL
+shared float sh_cm_tile_maximum[KVAR_COOPMAT_MATRIX_BATCHES * 16];
+shared float sh_cm_tile_denominator[KVAR_COOPMAT_MATRIX_BATCHES * 16];
+shared float sh_cm_old_scale[KVAR_COOPMAT_MATRIX_BATCHES * 16];
+shared float sh_cm_tile_scale[KVAR_COOPMAT_MATRIX_BATCHES * 16];
+#endif
+#endif
 
 layout(push_constant) uniform parameter {
     uint n_heads;
@@ -39,7 +86,11 @@ layout(push_constant) uniform parameter {
 layout(binding = 0, std430) readonly buffer Q       { uint data_q[]; };
 layout(binding = 1, std430) readonly buffer KRecord { uint data_krecord[]; };
 layout(binding = 2, std430) readonly buffer KStage  { uint data_kstage[]; };
+#ifdef KVAR_PRECOMPUTED_LIVE
+layout(binding = 3, std430) readonly buffer Live    { uint data_live[]; };
+#else
 layout(binding = 3, std430) readonly buffer KIndex  { uint data_kindex[]; };
+#endif
 layout(binding = 4, std430) readonly buffer VRecord { uint data_vrecord[]; };
 layout(binding = 5, std430) readonly buffer VStage  { uint data_vstage[]; };
 layout(binding = 6, std430) readonly buffer VIndex  { uint data_vindex[]; };
@@ -48,6 +99,13 @@ layout(binding = 8, std430) readonly buffer Sinks   { uint data_sinks[]; };
 layout(binding = 9, std430) buffer Dst              { uint data_dst[]; };
 layout(binding = 10, std430) readonly buffer KTail  { uint data_ktail[]; };
 layout(binding = 11, std430) readonly buffer VTail  { uint data_vtail[]; };
+
+#ifdef KVAR_PRECOMPUTED_LIVE
+// The direct route does not dereference indices during attention.  Keep the
+// generic helper bodies parsable; host admission guarantees these aliases are
+// unreachable in a precomputed-live pipeline.
+#define data_kindex data_live
+#endif
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TailMaskRef {
     uint data[];
@@ -74,14 +132,40 @@ const uint FLAG_SHARED_INDICES = 128u;
 const uint FLAG_TAIL_CURRENT = 256u;
 const uint FLAG_TAIL_BODYLESS = 512u;
 const uint FLAG_TAIL_HISTORY_SHIFT = 10u;
-const uint GQA_GROUP_MAX = 4u;
+#ifndef KVAR_GQA_GROUP_MAX
+#define KVAR_GQA_GROUP_MAX 4
+#endif
+#ifndef KVAR_COOPMAT_DIM_BLOCKS
+#define KVAR_COOPMAT_DIM_BLOCKS 32
+#endif
+const uint GQA_GROUP_MAX = uint(KVAR_GQA_GROUP_MAX);
+const uint COOPMAT_DIM_BLOCKS = uint(KVAR_COOPMAT_DIM_BLOCKS);
+const uint COOPMAT_MATRIX_BATCHES = uint(KVAR_COOPMAT_MATRIX_BATCHES);
+const uint COOPMAT_MAX_HEAD_DIM = uint(KVAR_COOPMAT_MAX_HEAD_DIM);
+const uint COOPMAT_MAX_HEAD_SLICES = uint(KVAR_COOPMAT_MAX_HEAD_SLICES);
 
 uint k_bits() {
-    return p.bits_packed & 0xffffu;
+    return p.bits_packed & 0x0fu;
 }
 
 uint v_bits() {
-    return p.bits_packed >> 16u;
+    return (p.bits_packed >> 4u) & 0x0fu;
+}
+
+uint body_splits() {
+    return (p.bits_packed >> 8u) & 0xffffu;
+}
+
+uint tail_splits() {
+    return p.bits_packed >> 24u;
+}
+
+uint tail_stride() {
+    return p.tail_stride & 0xffffu;
+}
+
+uint query_base() {
+    return p.tail_stride >> 16u;
 }
 
 uint head_slices() {
@@ -97,7 +181,11 @@ uint tail_groups() {
 }
 
 bool read_indirect() {
-    return (p.kvarn_shape_packed >> 24u) != 0u;
+    return ((p.kvarn_shape_packed >> 24u) & 1u) != 0u;
+}
+
+uint dispatch_mode() {
+    return (p.kvarn_shape_packed >> 25u) & 3u;
 }
 
 uint mask_ne3() {
@@ -116,6 +204,11 @@ uint gqa() {
     return p.query_shape_packed >> 16u;
 }
 
+uint cooperative_query_pack() {
+    const uint encoded = (p.kvarn_shape_packed >> 27u) & 0x1fu;
+    return encoded == 0u ? max(1u, 16u / gqa()) : encoded;
+}
+
 uint q_nb1() {
     return p.q_nb1;
 }
@@ -132,14 +225,38 @@ uint groups_per_stream() {
     return p.stream_group_packed >> 16u;
 }
 
-shared float sh_reduce[128];
-shared uint sh_live_group[128];
-shared uint sh_live_pos[128];
+#ifndef KVAR_COOPMAT
+shared float sh_reduce[GQA_GROUP_MAX * 8u];
+#ifndef KVAR_PRECOMPUTED_LIVE
+shared uint sh_live_group[256];
+shared uint sh_live_pos[256];
+#endif
 shared float sh_maximum[GQA_GROUP_MAX];
 shared float sh_denominator[GQA_GROUP_MAX];
 shared float sh_old_scale[GQA_GROUP_MAX];
 shared float sh_weight[GQA_GROUP_MAX];
 shared int sh_active;
+shared float sh_record_token_axes[8u * 4u * 3u];
+#else
+#ifdef KVAR_COOPMAT_PREFILL
+shared float sh_maximum[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_GQA_GROUP_MAX];
+shared float sh_denominator[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_GQA_GROUP_MAX];
+#else
+shared float sh_maximum[GQA_GROUP_MAX];
+shared float sh_denominator[GQA_GROUP_MAX];
+#endif
+shared int sh_active;
+#endif
+
+#ifdef KVAR_RECORD_TILE
+// Largest KVarN record: 128x128 at 8 bits plus three FP16 axis vectors.
+// A decode split stages one K or V record at a time, so the same LDS region is
+// reused for every head slice and for both operands.
+shared uint sh_record_cache[8u * 512u + 192u];
+shared float sh_block_score[GQA_GROUP_MAX * 64u];
+shared float sh_block_weight[GQA_GROUP_MAX * 64u];
+shared uint sh_block_enabled[GQA_GROUP_MAX * 64u];
+#endif
 
 uint read_index_low(bool value, uint token) {
     return value && (p.flags & FLAG_SHARED_INDICES) == 0u ?
@@ -173,6 +290,32 @@ uint unpack_record(bool value, uint record_base, uint index, uint bits) {
     return result & ((1u << bits) - 1u);
 }
 
+uint unpack_record4_item(uint lo, uint hi, uint bit, uint bits) {
+    uint result;
+    if (bit < 32u) {
+        result = lo >> bit;
+        if (bit + bits > 32u) {
+            result |= hi << (32u - bit);
+        }
+    } else {
+        result = hi >> (bit - 32u);
+    }
+    return result & ((1u << bits) - 1u);
+}
+
+uvec4 unpack_record4(bool value, uint record_base, uint index, uint bits) {
+    const uint bit_offset = index * bits;
+    const uint word_index = bit_offset >> 5u;
+    const uint bit = bit_offset & 31u;
+    const uint lo = load_record_word(value, record_base + word_index);
+    const uint hi = load_record_word(value, record_base + word_index + 1u);
+    return uvec4(
+        unpack_record4_item(lo, hi, bit, bits),
+        unpack_record4_item(lo, hi, bit + bits, bits),
+        unpack_record4_item(lo, hi, bit + 2u * bits, bits),
+        unpack_record4_item(lo, hi, bit + 3u * bits, bits));
+}
+
 float load_axis(
         bool value,
         uint record_base,
@@ -184,6 +327,7 @@ float load_axis(
     return (index & 1u) == 0u ? pair.x : pair.y;
 }
 
+#ifndef KVAR_PRECOMPUTED_LIVE
 void compute_live(
         bool value,
         uint stream,
@@ -192,7 +336,7 @@ void compute_live(
         out uint live_pos) {
     uint group_best = 0u;
     uint pos_best = 0u;
-    for (uint i = lane; i < p.n_indices; i += KVAR_N_DIM) {
+    for (uint i = lane; i < p.n_indices; i += gl_WorkGroupSize.x) {
         const bool swa = (p.flags & FLAG_SWA) != 0u;
         bool explicitly_staged;
         const int index = read_cell(value, i, swa, explicitly_staged);
@@ -200,12 +344,12 @@ void compute_live(
             continue;
         }
         const uint global_group = uint(index) / KVAR_N_DIM;
-        const uint index_stream = (p.flags & FLAG_SWA) != 0u ?
+        const uint index_stream = swa ?
             stream : global_group / groups_per_stream();
         if (index_stream != stream) {
             continue;
         }
-        const uint group = (p.flags & FLAG_SWA) != 0u ?
+        const uint group = swa ?
             global_group : global_group - stream * groups_per_stream();
         const uint pos = uint(index) % KVAR_N_DIM;
         if (group > group_best || (group == group_best && pos > pos_best)) {
@@ -216,7 +360,7 @@ void compute_live(
     sh_live_group[lane] = group_best;
     sh_live_pos[lane] = pos_best;
     barrier();
-    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
         if (lane < stride) {
             const uint other_group = sh_live_group[lane + stride];
             const uint other_pos = sh_live_pos[lane + stride];
@@ -232,6 +376,7 @@ void compute_live(
     live_group = sh_live_group[0];
     live_pos = sh_live_pos[0];
 }
+#endif
 
 float load_kvarn(
         bool value,
@@ -348,18 +493,749 @@ float load_tail(bool value, uint slot, uint head, uint dim) {
 }
 
 float load_tail_mask(uint token, uint query, uint stream) {
-    const uint half_index = token + query * p.tail_stride +
-        stream * p.tail_stride * n_query();
+    const uint half_index = token + query * tail_stride() +
+        stream * tail_stride() * n_query();
     TailMaskRef tail_mask = TailMaskRef(p.tail_mask_addr);
     return load_u16_word(
         tail_mask.data[half_index >> 1u], half_index, false);
 }
 
+#ifdef KVAR_RECORD_TILE
+uint unpack_cached_record(uint index, uint bits) {
+    const uint bit_offset = index * bits;
+    const uint word_index = bit_offset >> 5u;
+    const uint bit = bit_offset & 31u;
+    uint result = sh_record_cache[word_index] >> bit;
+    if (bit + bits > 32u) {
+        result |= sh_record_cache[word_index + 1u] << (32u - bit);
+    }
+    return result & ((1u << bits) - 1u);
+}
+
+float load_cached_axis(uint payload_words, uint axis, uint index) {
+    const vec2 pair = unpackHalf2x16(
+        sh_record_cache[payload_words + axis * 64u + (index >> 1u)]);
+    return (index & 1u) == 0u ? pair.x : pair.y;
+}
+
+void cache_record(bool value, uint record_base, uint record_words, uint lane) {
+    for (uint i = lane; i < record_words; i += gl_WorkGroupSize.x) {
+        sh_record_cache[i] = load_record_word(value, record_base + i);
+    }
+    barrier();
+}
+#endif
+
+bool direct_body_record_available(
+        bool value,
+        uint group,
+        uint live_group,
+        uint live_pos) {
+    if ((p.flags & FLAG_SWA) != 0u || read_indirect()) {
+        return false;
+    }
+    if ((p.flags & FLAG_EAGER) != 0u) {
+        const bool from_stage = group == 0u ||
+            (group == live_group && live_pos < 127u);
+        const bool completed = group < live_group ||
+            (group == live_group && live_pos == 127u);
+        return !from_stage && completed && group > 0u &&
+            group < groups_per_stream();
+    }
+    const bool from_stage = group == 0u ||
+        (group > 0u && group <= live_group &&
+         group + (tail_groups() - 1u) >= live_group);
+    return !from_stage && group < live_group && group < groups_per_stream();
+}
+
+uint direct_record_base(
+        bool value,
+        uint stream,
+        uint group,
+        uint logical_head,
+        uint slice) {
+    const uint bits = value ? v_bits() : k_bits();
+    const uint record_words = bits * 512u + 192u;
+    const uint head = logical_head * head_slices() + slice;
+    return ((stream * groups_per_stream() + group) * p.n_heads + head) *
+        record_words;
+}
+
+#ifdef KVAR_COOPMAT
+
+// RDNA3 decode and short-verification route.  Each of the four wave64
+// subgroups handles one 16-token quarter of a 64-token split.  GQA heads are
+// matrix rows, so K/V reconstruction is shared across all heads instead of
+// being repeated by independent attention workgroups.
 void main() {
+    if (gl_NumSubgroups != 4u) {
+        return;
+    }
+
     const uint lane = gl_LocalInvocationID.x;
-    const uint split_k = gl_NumWorkGroups.x / n_query();
+    const uint wave = gl_SubgroupID;
+    const uint wave_lane = gl_SubgroupInvocationID;
+    const uint split_k = max(body_splits() + tail_splits(), 1u);
+    const bool body_only_dispatch = dispatch_mode() == 1u;
+    const bool tail_only_dispatch = dispatch_mode() == 2u;
+    const uint dispatch_splits = body_only_dispatch ?
+        max(body_splits(), 1u) :
+        (tail_only_dispatch ? max(tail_splits(), 1u) : split_k);
+    const uint dispatch_split = gl_WorkGroupID.x % dispatch_splits;
+    const uint split_index = tail_only_dispatch ?
+        body_splits() + dispatch_split : dispatch_split;
+    const uint query_group = gl_WorkGroupID.x / dispatch_splits;
+    const uint out_stream = gl_WorkGroupID.z;
+    const uint stream = stream_start() + out_stream;
+    const uint n_kv_heads = p.n_heads / head_slices();
+    const uint n_query_heads = n_kv_heads * gqa();
+    // Body and exact-tail tiles share the same sequence-wide K/V rows. Pack
+    // multiple queries into the 16 cooperative-matrix rows for both routes;
+    // their different causal visibility remains encoded in the masks.
+    const uint query_pack = cooperative_query_pack();
+    const uint query_groups = gl_NumWorkGroups.x / dispatch_splits;
+    const uint tile_queries = min(query_groups * query_pack,
+        n_query() - query_base());
+    const uint local_query_base = query_group * query_pack;
+    const uint queries_here = min(query_pack,
+        tile_queries - min(local_query_base, tile_queries));
+    const uint query = query_base() + local_query_base;
+    const uint logical_head = gl_WorkGroupID.y;
+    const uint query_head_first = logical_head * gqa();
+#ifdef KVAR_COOPMAT_PREFILL
+    const uint queries_per_matrix = max(1u, 16u / gqa());
+    const uint first_queries = min(queries_here, queries_per_matrix);
+    const uint second_queries = min(
+        queries_here - first_queries, queries_per_matrix);
+    const uint third_queries = queries_here - first_queries - second_queries;
+    const uint active_rows = first_queries * gqa();
+    const uint second_active_rows = second_queries * gqa();
+    const uint third_active_rows = third_queries * gqa();
+    const uint matrix_batches = min(COOPMAT_MATRIX_BATCHES,
+        third_queries > 0u ? 3u : (second_queries > 0u ? 2u : 1u));
+#else
+    const uint active_rows = queries_here * gqa();
+#endif
+    const bool has_tail = (p.flags & FLAG_TAIL) != 0u && !body_only_dispatch;
+    const uint n_body_splits = body_splits();
+    const uint n_tail_splits = tail_splits();
+    const bool process_body = body_only_dispatch ||
+        (!tail_only_dispatch && split_index < n_body_splits);
+    const bool process_tail = has_tail && split_index >= n_body_splits &&
+        split_index < n_body_splits + n_tail_splits;
+
+    if (lane == 0u) {
+        sh_active = -1;
+        if (has_tail) {
+            QueryOrderRef query_order = QueryOrderRef(p.query_order_addr);
+            for (uint local_query = 0u; local_query < queries_here; ++local_query) {
+                const int query_id = int(out_stream * n_query() + query + local_query);
+                int active_desc = -1;
+                for (uint packed = 0u; packed < p.query_order_nelements; ++packed) {
+                    if (query_order.data[packed] == query_id) {
+                        active_desc = int(packed / query_order_ne0());
+                        break;
+                    }
+                }
+                if (active_desc < 0 || (sh_active >= 0 && active_desc != sh_active)) {
+                    sh_active = -1;
+                    break;
+                }
+                sh_active = active_desc;
+            }
+        }
+    }
+    barrier();
+    if (has_tail && sh_active < 0) {
+        return;
+    }
+
+    uint k_live_group = 0u;
+    uint k_live_pos = 0u;
+    uint v_live_group = 0u;
+    uint v_live_pos = 0u;
+#ifdef KVAR_PRECOMPUTED_LIVE
+    const uint k_live_base = 2u * out_stream;
+    const uint v_live_base = (p.flags & FLAG_SHARED_INDICES) != 0u ?
+        k_live_base : 2u * gl_NumWorkGroups.z + k_live_base;
+    k_live_group = data_live[k_live_base + 0u];
+    k_live_pos = data_live[k_live_base + 1u];
+    v_live_group = data_live[v_live_base + 0u];
+    v_live_pos = data_live[v_live_base + 1u];
+#else
+    compute_live(false, stream, lane, k_live_group, k_live_pos);
+    if ((p.flags & FLAG_SHARED_INDICES) != 0u) {
+        v_live_group = k_live_group;
+        v_live_pos = k_live_pos;
+    } else {
+        compute_live(true, stream, lane, v_live_group, v_live_pos);
+    }
+#endif
+
+#ifdef KVAR_HEAD_DIM
+    const uint head_dim = uint(KVAR_HEAD_DIM);
+#else
+    const uint head_dim = head_slices() * KVAR_N_DIM;
+#endif
+    const uint body_tile_count = (p.n_kv + 63u) / 64u;
+    uint split_tile_begin = 0u;
+    uint split_tile_end = 0u;
+    uint tail_token_count = 0u;
+    if (process_body) {
+        split_tile_begin = body_tile_count * split_index /
+            max(n_body_splits, 1u);
+        split_tile_end = body_tile_count * (split_index + 1u) /
+            max(n_body_splits, 1u);
+    } else if (process_tail) {
+        RunDescRef run_desc = RunDescRef(p.run_desc_addr);
+        const uint desc_base = uint(sh_active) * p.run_desc_ne0;
+        tail_token_count = uint(max(run_desc.data[desc_base + 4u], 0));
+        const uint tail_split = split_index - n_body_splits;
+        split_tile_begin = tail_split;
+        split_tile_end = tail_split + 1u;
+    }
+
+#ifdef KVAR_COOPMAT_PREFILL
+    // A prefill workgroup can own several 64-token record tiles. Keep its
+    // partial numerator in registers and merge tile-local softmax statistics
+    // online, avoiding one global workspace plane and reducer input per tile.
+    // Cache this invocation's query element for every 16-wide dimension slice.
+    // Reusing it across all body tiles avoids rereading the query tensor once
+    // per record, which matters increasingly as the populated context grows.
+    float16_t query_cache[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
+    float accumulator[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
+    for (uint i = 0u; i < COOPMAT_MATRIX_BATCHES * COOPMAT_DIM_BLOCKS; ++i) {
+        accumulator[i] = 0.0;
+    }
+    const uint cached_q_row = lane >> 4u;
+    const uint cached_q_dim_local = lane & 15u;
+    for (uint matrix_batch = 0u; matrix_batch < matrix_batches; ++matrix_batch) {
+        const uint batch_active_rows = matrix_batch == 0u ? active_rows :
+            (matrix_batch == 1u ? second_active_rows : third_active_rows);
+        const uint batch_query_base = matrix_batch * queries_per_matrix;
+        for (uint dim_base = 0u; dim_base < head_dim; dim_base += 16u) {
+            float q_value = 0.0;
+            if (cached_q_row < batch_active_rows) {
+                const uint row_query = query_base() + local_query_base +
+                    batch_query_base + cached_q_row / gqa();
+                const uint query_head = query_head_first + cached_q_row % gqa();
+                const uint q_base = row_query * q_nb1() + query_head * q_nb2() +
+                    out_stream * head_dim * n_query() * n_query_heads;
+                q_value = uintBitsToFloat(
+                    data_q[q_base + dim_base + cached_q_dim_local]) * p.scale;
+            }
+            query_cache[matrix_batch * COOPMAT_DIM_BLOCKS + dim_base / 16u] =
+                float16_t(q_value);
+        }
+    }
+#endif
+#ifdef KVAR_COOPMAT_PREFILL
+    if (lane < matrix_batches * 16u) {
+        const uint matrix_batch = lane >> 4u;
+        const uint row = lane & 15u;
+        const uint batch_active_rows = matrix_batch == 0u ? active_rows :
+            (matrix_batch == 1u ? second_active_rows : third_active_rows);
+        if (row < batch_active_rows) {
+            sh_maximum[matrix_batch * 16u + row] = -3.402823466e38;
+            sh_denominator[matrix_batch * 16u + row] = 0.0;
+        }
+    }
+    barrier();
+#endif
+
+    const uint matrix_values = head_dim * tile_queries * n_query_heads *
+        gl_NumWorkGroups.z * split_k;
+
+    for (uint split_tile = split_tile_begin;
+            split_tile < split_tile_end; ++split_tile) {
+    const uint token_begin = split_tile * 64u;
+    const uint token_end = min(token_begin + 64u,
+        process_body ? p.n_kv : tail_token_count);
+    const uint tile_tokens = token_end - min(token_begin, token_end);
+
+    if (process_tail) {
+        RunDescRef run_desc = RunDescRef(p.run_desc_addr);
+        const uint desc_base = uint(sh_active) * p.run_desc_ne0;
+        for (uint local_token = lane; local_token < 64u;
+                local_token += gl_WorkGroupSize.x) {
+            sh_cm_tail_slot[local_token] = local_token < tile_tokens ?
+                uint(run_desc.data[desc_base + 6u + token_begin + local_token]) : 0u;
+        }
+    }
+
+    const uint body_group = token_begin / KVAR_N_DIM;
+    const bool fast_record = process_body && tile_tokens > 0u &&
+        token_end <= (body_group + 1u) * KVAR_N_DIM &&
+        direct_body_record_available(false, body_group, k_live_group, k_live_pos) &&
+        direct_body_record_available(true, body_group, v_live_group, v_live_pos);
+
+    if (fast_record) {
+        for (uint dim = lane; dim < head_dim; dim += gl_WorkGroupSize.x) {
+            const uint slice = dim >> 7u;
+            const uint slice_dim = dim & 127u;
+            const uint k_base = direct_record_base(
+                false, stream, body_group, logical_head, slice);
+            const uint v_base = direct_record_base(
+                true, stream, body_group, logical_head, slice);
+            sh_cm_dim_axes[0u * COOPMAT_MAX_HEAD_DIM + dim] = float16_t(load_axis(
+                false, k_base, k_bits() * 512u, 0u, slice_dim));
+            sh_cm_dim_axes[1u * COOPMAT_MAX_HEAD_DIM + dim] = float16_t(load_axis(
+                false, k_base, k_bits() * 512u, 1u, slice_dim));
+            sh_cm_dim_axes[2u * COOPMAT_MAX_HEAD_DIM + dim] = float16_t(load_axis(
+                true, v_base, v_bits() * 512u, 2u, slice_dim));
+        }
+        for (uint i = lane; i < 64u * head_slices();
+                i += gl_WorkGroupSize.x) {
+            const uint local_token = i / head_slices();
+            const uint slice = i - local_token * head_slices();
+            if (local_token < tile_tokens) {
+                const uint pos = (token_begin + local_token) & 127u;
+                const uint k_base = direct_record_base(
+                    false, stream, body_group, logical_head, slice);
+                const uint v_base = direct_record_base(
+                    true, stream, body_group, logical_head, slice);
+                sh_cm_token_axes[(0u * COOPMAT_MAX_HEAD_SLICES + slice) * 64u + local_token] = float16_t(load_axis(
+                    false, k_base, k_bits() * 512u, 2u, pos));
+                sh_cm_token_axes[(1u * COOPMAT_MAX_HEAD_SLICES + slice) * 64u + local_token] = float16_t(load_axis(
+                    true, v_base, v_bits() * 512u, 0u, pos));
+                sh_cm_token_axes[(2u * COOPMAT_MAX_HEAD_SLICES + slice) * 64u + local_token] = float16_t(load_axis(
+                    true, v_base, v_bits() * 512u, 1u, pos));
+            }
+        }
+    }
+    barrier();
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> score_mat =
+        coopmat<float, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator>(0.0);
+#ifdef KVAR_COOPMAT_PREFILL
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> score_mat_second =
+        coopmat<float, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator>(0.0);
+#if KVAR_COOPMAT_MATRIX_BATCHES > 2
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> score_mat_third =
+        coopmat<float, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator>(0.0);
+#endif
+#endif
+    for (uint dim_base = 0u; dim_base < head_dim; dim_base += 16u) {
+        // Applying the scale before FP16 conversion matches the established
+        // Vulkan cooperative-matrix FA path. Each invocation owns one element
+        // of this 16x16 query slice.
+        const uint q_row = lane >> 4u;
+        const uint q_dim_local = lane & 15u;
+#ifdef KVAR_COOPMAT_PREFILL
+        sh_cm_q_or_p[q_row * 16u + q_dim_local] =
+            query_cache[dim_base / 16u];
+        if (matrix_batches > 1u) {
+            sh_cm_q_or_p[64u * 16u + q_row * 16u + q_dim_local] =
+                query_cache[COOPMAT_DIM_BLOCKS + dim_base / 16u];
+        }
+#if KVAR_COOPMAT_MATRIX_BATCHES > 2
+        if (matrix_batches > 2u) {
+            sh_cm_q_or_p[2u * 64u * 16u + q_row * 16u + q_dim_local] =
+                query_cache[2u * COOPMAT_DIM_BLOCKS + dim_base / 16u];
+        }
+#endif
+#else
+        float q_value = 0.0;
+        if (q_row < active_rows) {
+            const uint row_query = query_base() + local_query_base + q_row / gqa();
+            const uint query_head = query_head_first + q_row % gqa();
+            const uint q_base = row_query * q_nb1() + query_head * q_nb2() +
+                out_stream * head_dim * n_query() * n_query_heads;
+            q_value = uintBitsToFloat(data_q[q_base + dim_base + q_dim_local]) * p.scale;
+        }
+        sh_cm_q_or_p[q_row * 16u + q_dim_local] = float16_t(q_value);
+#endif
+
+        if (fast_record) {
+            // Four adjacent token values share one packed word pair.
+            const uint dim_local = lane >> 4u;
+            const uint local_token_base = (lane & 15u) * 4u;
+            const uint dim = dim_base + dim_local;
+            const uint slice = dim >> 7u;
+            const uint slice_dim = dim & 127u;
+            const uint pos_base =
+                (token_begin + local_token_base) & 127u;
+            const uint record_base = direct_record_base(
+                false, stream, body_group, logical_head, slice);
+            const uvec4 quant = unpack_record4(false, record_base,
+                slice_dim * KVAR_N_DIM + pos_base, k_bits());
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint local_token = local_token_base + j;
+                float value = 0.0;
+                if (local_token < tile_tokens) {
+                    value = (float(quant[j]) *
+                                float(sh_cm_dim_axes[0u * COOPMAT_MAX_HEAD_DIM + dim]) +
+                                float(sh_cm_dim_axes[1u * COOPMAT_MAX_HEAD_DIM + dim])) *
+                        float(sh_cm_token_axes[
+                            (0u * COOPMAT_MAX_HEAD_SLICES + slice) * 64u + local_token]);
+                }
+                sh_cm_tile[local_token * 16u + dim_local] =
+                    float16_t(value);
+            }
+        } else {
+            for (uint i = lane; i < 16u * 64u; i += gl_WorkGroupSize.x) {
+                const uint dim_local = i / 64u;
+                const uint local_token = i & 63u;
+                float value = 0.0;
+                const uint dim = dim_base + dim_local;
+                if (local_token < tile_tokens && process_body) {
+                    const uint token = token_begin + local_token;
+                    const uint slice = dim >> 7u;
+                    value = load_kvarn(false, logical_head, token, stream,
+                        k_live_group, k_live_pos, slice, dim & 127u);
+                } else if (local_token < tile_tokens && process_tail) {
+                    value = load_tail(false, sh_cm_tail_slot[local_token],
+                        logical_head, dim);
+                }
+                sh_cm_tile[local_token * 16u + dim_local] =
+                    float16_t(value);
+            }
+        }
+        barrier();
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> k_mat;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> q_mat;
+        coopMatLoad(k_mat, sh_cm_tile, wave * 16u * 16u, 16u,
+            gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(q_mat, sh_cm_q_or_p, 0u, 16u,
+            gl_CooperativeMatrixLayoutColumnMajor);
+        score_mat = coopMatMulAdd(k_mat, q_mat, score_mat);
+#ifdef KVAR_COOPMAT_PREFILL
+        if (matrix_batches > 1u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> q_mat_second;
+            coopMatLoad(q_mat_second, sh_cm_q_or_p, 64u * 16u, 16u,
+                gl_CooperativeMatrixLayoutColumnMajor);
+            score_mat_second = coopMatMulAdd(
+                k_mat, q_mat_second, score_mat_second);
+        }
+#if KVAR_COOPMAT_MATRIX_BATCHES > 2
+        if (matrix_batches > 2u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> q_mat_third;
+            coopMatLoad(q_mat_third, sh_cm_q_or_p, 2u * 64u * 16u, 16u,
+                gl_CooperativeMatrixLayoutColumnMajor);
+            score_mat_third = coopMatMulAdd(
+                k_mat, q_mat_third, score_mat_third);
+        }
+#endif
+#endif
+        barrier();
+    }
+
+#ifndef KVAR_COOPMAT_PREFILL
+    coopMatStore(score_mat, sh_cm_score_or_pv, wave * 16u * 16u, 16u,
+        gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+#endif
+
+    // Q is dead after QK. Reuse its storage for the 64x16 FP16 probability
+    // matrices consumed by PV.
+#ifdef KVAR_COOPMAT_PREFILL
+    const uint probability_values = matrix_batches * 64u * 16u;
+#else
+    const uint probability_values = 64u * 16u;
+#endif
+    for (uint i = lane; i < probability_values; i += gl_WorkGroupSize.x) {
+        sh_cm_q_or_p[i] = float16_t(0.0);
+    }
+    barrier();
+
+    uint n_head_log2 = 1u;
+    while ((n_head_log2 << 1u) <= n_query_heads) {
+        n_head_log2 <<= 1u;
+    }
+    const float m0 = exp2(-p.max_bias / float(n_head_log2));
+    const float m1 = exp2(-(p.max_bias / 2.0) / float(n_head_log2));
+#ifdef KVAR_COOPMAT_PREFILL
+    for (uint matrix_batch = 0u; matrix_batch < matrix_batches; ++matrix_batch) {
+        if (matrix_batch == 0u) {
+            coopMatStore(score_mat, sh_cm_score_or_pv,
+                wave * 16u * 16u, 16u,
+                gl_CooperativeMatrixLayoutRowMajor);
+        } else if (matrix_batch == 1u) {
+            coopMatStore(score_mat_second, sh_cm_score_or_pv,
+                wave * 16u * 16u, 16u,
+                gl_CooperativeMatrixLayoutRowMajor);
+#if KVAR_COOPMAT_MATRIX_BATCHES > 2
+        } else {
+            coopMatStore(score_mat_third, sh_cm_score_or_pv,
+                wave * 16u * 16u, 16u,
+                gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        }
+        barrier();
+        const uint batch_active_rows = matrix_batch == 0u ? active_rows :
+            (matrix_batch == 1u ? second_active_rows : third_active_rows);
+        const uint batch_query_base = matrix_batch * queries_per_matrix;
+        const uint stats_base = matrix_batch * 16u;
+        const uint probability_base = matrix_batch * 64u * 16u;
+#else
+    const uint batch_active_rows = active_rows;
+    const uint batch_query_base = 0u;
+    const uint stats_base = 0u;
+    const uint probability_base = 0u;
+#endif
+    for (uint row_base = 0u; row_base < batch_active_rows; row_base += 4u) {
+        const uint row = row_base + wave;
+        const uint local_token = wave_lane;
+        bool enabled = row < batch_active_rows && local_token < tile_tokens;
+        float score = -3.402823466e38;
+        if (enabled) {
+            const uint row_query = query_base() + local_query_base +
+                batch_query_base + row / gqa();
+            const uint query_head = query_head_first + row % gqa();
+            const float slope = p.max_bias > 0.0 ?
+                (query_head < n_head_log2 ?
+                    pow(m0, float(query_head + 1u)) :
+                    pow(m1, float(2u * (query_head - n_head_log2) + 1u))) : 1.0;
+            const uint token = token_begin + local_token;
+            const float mask_value = process_tail ?
+                slope * load_tail_mask(token, row_query, out_stream) :
+                ((p.flags & FLAG_MASK) != 0u ?
+                    slope * load_mask(token, row_query, out_stream) : 0.0);
+            score = sh_cm_score_or_pv[local_token * 16u + row];
+            if (p.logit_softcap != 0.0) {
+                score = p.logit_softcap * tanh(score);
+            }
+            score += mask_value;
+            enabled = !(isinf(mask_value) && mask_value < 0.0);
+        }
+        const float maximum = subgroupMax(enabled ? score : -3.402823466e38);
+        if (wave_lane == 0u && row < batch_active_rows) {
+#ifdef KVAR_COOPMAT_PREFILL
+            sh_cm_tile_maximum[stats_base + row] = maximum;
+#else
+            sh_maximum[row] = maximum;
+#endif
+        }
+        const float weight = enabled && maximum > -3.0e38 ?
+            exp(score - maximum) : 0.0;
+        if (row < batch_active_rows && local_token < tile_tokens) {
+            sh_cm_q_or_p[probability_base + local_token * 16u + row] =
+                float16_t(weight);
+        }
+        const float denominator = subgroupAdd(weight);
+        if (wave_lane == 0u && row < batch_active_rows) {
+#ifdef KVAR_COOPMAT_PREFILL
+            sh_cm_tile_denominator[stats_base + row] = denominator;
+#else
+            sh_denominator[row] = denominator;
+#endif
+        }
+        barrier();
+    }
+
+#ifdef KVAR_COOPMAT_PREFILL
+    if (lane < batch_active_rows) {
+        const uint stats_index = stats_base + lane;
+        const float previous_maximum = sh_maximum[stats_index];
+        const float tile_maximum = sh_cm_tile_maximum[stats_index];
+        const float next_maximum = max(previous_maximum, tile_maximum);
+        const float old_scale = previous_maximum < -3.0e38 ? 0.0 :
+            exp(previous_maximum - next_maximum);
+        const float tile_scale = tile_maximum < -3.0e38 ? 0.0 :
+            exp(tile_maximum - next_maximum);
+        sh_cm_old_scale[stats_index] = old_scale;
+        sh_cm_tile_scale[stats_index] = tile_scale;
+        sh_maximum[stats_index] = next_maximum;
+        sh_denominator[stats_index] = sh_denominator[stats_index] * old_scale +
+            sh_cm_tile_denominator[stats_index] * tile_scale;
+    }
+    barrier();
+    }
+#endif
+
+    for (uint dim_base = 0u; dim_base < head_dim; dim_base += 16u) {
+        if (fast_record) {
+            // V is token-major, so four adjacent output dimensions share one
+            // packed word pair and token scale/zero pair.
+            const uint local_token = lane >> 2u;
+            const uint dim_local_base = (lane & 3u) * 4u;
+            const uint dim = dim_base + dim_local_base;
+            const uint slice = dim >> 7u;
+            const uint slice_dim = dim & 127u;
+            const uint pos = (token_begin + local_token) & 127u;
+            const uint record_base = direct_record_base(
+                true, stream, body_group, logical_head, slice);
+            const uvec4 quant = unpack_record4(true, record_base,
+                pos * KVAR_N_DIM + slice_dim, v_bits());
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint out_dim = dim + j;
+                float value = 0.0;
+                if (local_token < tile_tokens) {
+                    value = (float(quant[j]) *
+                                float(sh_cm_token_axes[
+                                    (1u * COOPMAT_MAX_HEAD_SLICES + slice) * 64u + local_token]) +
+                                float(sh_cm_token_axes[
+                                    (2u * COOPMAT_MAX_HEAD_SLICES + slice) * 64u + local_token])) *
+                        float(sh_cm_dim_axes[2u * COOPMAT_MAX_HEAD_DIM + out_dim]);
+                }
+                sh_cm_tile[local_token * 16u + dim_local_base + j] =
+                    float16_t(value);
+            }
+        } else {
+            for (uint i = lane; i < 64u * 16u; i += gl_WorkGroupSize.x) {
+                const uint local_token = i / 16u;
+                const uint dim_local = i & 15u;
+                float value = 0.0;
+                const uint dim = dim_base + dim_local;
+                if (local_token < tile_tokens && process_body) {
+                    const uint token = token_begin + local_token;
+                    const uint slice = dim >> 7u;
+                    value = load_kvarn(true, logical_head, token, stream,
+                        v_live_group, v_live_pos, slice, dim & 127u);
+                } else if (local_token < tile_tokens && process_tail) {
+                    value = load_tail(true, sh_cm_tail_slot[local_token],
+                        logical_head, dim);
+                }
+                sh_cm_tile[local_token * 16u + dim_local] =
+                    float16_t(value);
+            }
+        }
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> v_mat;
+        coopMatLoad(v_mat, sh_cm_tile, wave * 16u * 16u, 16u,
+            gl_CooperativeMatrixLayoutRowMajor);
+#ifdef KVAR_COOPMAT_PREFILL
+        for (uint matrix_batch = 0u; matrix_batch < matrix_batches; ++matrix_batch) {
+            const uint batch_active_rows = matrix_batch == 0u ? active_rows :
+                (matrix_batch == 1u ? second_active_rows : third_active_rows);
+            const uint batch_query_base = matrix_batch * queries_per_matrix;
+            const uint stats_base = matrix_batch * 16u;
+            const uint probability_base = matrix_batch * 64u * 16u;
+#else
+        const uint batch_active_rows = active_rows;
+        const uint batch_query_base = 0u;
+        const uint stats_base = 0u;
+        const uint probability_base = 0u;
+#endif
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> p_mat;
+        coopmat<float, gl_ScopeSubgroup, 16, 16,
+            gl_MatrixUseAccumulator> pv_mat =
+                coopmat<float, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseAccumulator>(0.0);
+        coopMatLoad(p_mat, sh_cm_q_or_p,
+            probability_base + wave * 16u * 16u, 16u,
+            gl_CooperativeMatrixLayoutColumnMajor);
+        pv_mat = coopMatMulAdd(p_mat, v_mat, pv_mat);
+        coopMatStore(pv_mat, sh_cm_score_or_pv, wave * 16u * 16u, 16u,
+            gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        for (uint i = lane; i < batch_active_rows * 16u;
+                i += gl_WorkGroupSize.x) {
+            const uint row = i / 16u;
+            const uint dim_local = i & 15u;
+            float value = 0.0;
+            for (uint subgroup = 0u; subgroup < 4u; ++subgroup) {
+                value += sh_cm_score_or_pv[subgroup * 16u * 16u + row * 16u + dim_local];
+            }
+#ifdef KVAR_COOPMAT_PREFILL
+            const uint accumulator_slot = dim_base / 16u;
+            const uint accumulator_index =
+                matrix_batch * COOPMAT_DIM_BLOCKS + accumulator_slot;
+            accumulator[accumulator_index] =
+                accumulator[accumulator_index] * sh_cm_old_scale[stats_base + row] +
+                value * sh_cm_tile_scale[stats_base + row];
+#else
+            const uint row_query_local = local_query_base +
+                batch_query_base + row / gqa();
+            const uint query_head = query_head_first + row % gqa();
+            const uint matrix_base = head_dim * n_query_heads *
+                (split_index + split_k *
+                    (row_query_local + tile_queries * out_stream)) +
+                head_dim * query_head;
+            data_dst[matrix_base + dim_base + dim_local] =
+                floatBitsToUint(value);
+#endif
+        }
+        barrier();
+#ifdef KVAR_COOPMAT_PREFILL
+        }
+#endif
+    }
+    }
+
+#ifdef KVAR_COOPMAT_PREFILL
+    for (uint matrix_batch = 0u; matrix_batch < matrix_batches; ++matrix_batch) {
+        const uint batch_active_rows = matrix_batch == 0u ? active_rows :
+            (matrix_batch == 1u ? second_active_rows : third_active_rows);
+        const uint batch_query_base = matrix_batch * queries_per_matrix;
+        const uint stats_base = matrix_batch * 16u;
+        if (lane < batch_active_rows * 16u) {
+            const uint row = lane / 16u;
+            const uint dim_local = lane & 15u;
+            const uint row_query_local = local_query_base +
+                batch_query_base + row / gqa();
+            const uint query_head = query_head_first + row % gqa();
+            const uint matrix_base = head_dim * n_query_heads *
+                (split_index + split_k *
+                    (row_query_local + tile_queries * out_stream)) +
+                head_dim * query_head;
+            for (uint dim_base = 0u; dim_base < head_dim; dim_base += 16u) {
+                data_dst[matrix_base + dim_base + dim_local] = floatBitsToUint(
+                    accumulator[matrix_batch * COOPMAT_DIM_BLOCKS + dim_base / 16u]);
+            }
+        }
+        if (lane < batch_active_rows) {
+            const uint row_query_local = local_query_base +
+                batch_query_base + lane / gqa();
+            const uint query_head = query_head_first + lane % gqa();
+            const uint lm_base = matrix_values + n_query_heads * 2u *
+                (split_index + split_k *
+                    (row_query_local + tile_queries * out_stream));
+            data_dst[lm_base + query_head] =
+                floatBitsToUint(sh_denominator[stats_base + lane]);
+            data_dst[lm_base + n_query_heads + query_head] =
+                floatBitsToUint(sh_maximum[stats_base + lane]);
+        }
+    }
+#else
+    if (lane < active_rows) {
+        const uint row_query_local = local_query_base + lane / gqa();
+        const uint query_head = query_head_first + lane % gqa();
+        const uint lm_base = matrix_values + n_query_heads * 2u *
+            (split_index + split_k *
+                (row_query_local + tile_queries * out_stream));
+        data_dst[lm_base + query_head] = floatBitsToUint(sh_denominator[lane]);
+        data_dst[lm_base + n_query_heads + query_head] =
+            floatBitsToUint(sh_maximum[lane]);
+    }
+#endif
+}
+
+#elif defined(KVAR_TILED_WAVE64)
+
+// RDNA3 decode/short-verification route. Four wave64 subgroups evaluate four
+// tokens concurrently and share one online-softmax update. This keeps each
+// 64-token body/tail split distributed while removing the portable shader's
+// cross-wave reduction and per-token workgroup barriers.
+const uint KVAR_TILE_TOKENS = 4u;
+const uint KVAR_MAX_HEAD_DIM = 512u;
+const uint KVAR_DIMS_PER_THREAD = KVAR_MAX_HEAD_DIM / 256u;
+
+shared float sh_value_tile[KVAR_TILE_TOKENS * KVAR_MAX_HEAD_DIM];
+shared float sh_score_tile[GQA_GROUP_MAX * KVAR_TILE_TOKENS];
+shared float sh_tile_weight[GQA_GROUP_MAX * KVAR_TILE_TOKENS];
+shared uint sh_score_enabled[GQA_GROUP_MAX * KVAR_TILE_TOKENS];
+
+void main() {
+    // The host only selects this pipeline with a required subgroup size of 64.
+    // Keep the guard so an incorrectly created pipeline fails closed instead
+    // of indexing the fixed four-token shared-memory tile incorrectly.
+    if (gl_NumSubgroups != KVAR_TILE_TOKENS) {
+        return;
+    }
+
+    const uint lane = gl_LocalInvocationID.x;
+    const uint wave = gl_SubgroupID;
+    const uint wave_lane = gl_SubgroupInvocationID;
+    const uint split_k = max(body_splits() + tail_splits(), 1u);
     const uint split_index = gl_WorkGroupID.x % split_k;
-    const uint query = gl_WorkGroupID.x / split_k;
+    const uint local_query = gl_WorkGroupID.x / split_k;
+    const uint query = query_base() + local_query;
     const uint out_stream = gl_WorkGroupID.z;
     const uint stream = stream_start() + out_stream;
     const uint n_kv_heads = p.n_heads / head_slices();
@@ -373,7 +1249,11 @@ void main() {
         gqa_group_size, gqa() - gqa_group * gqa_group_size);
     const bool has_tail = (p.flags & FLAG_TAIL) != 0u;
     const bool bodyless = (p.flags & FLAG_TAIL_BODYLESS) != 0u;
-    const bool process_tail = has_tail && split_index + 1u == split_k;
+    const uint n_body_splits = body_splits();
+    const uint n_tail_splits = tail_splits();
+    const bool process_body = !bodyless && split_index < n_body_splits;
+    const bool process_tail = has_tail && split_index >= n_body_splits &&
+        split_index < n_body_splits + n_tail_splits;
 
     if (lane == 0u) {
         sh_active = -1;
@@ -398,6 +1278,15 @@ void main() {
     uint v_live_group = 0u;
     uint v_live_pos = 0u;
     if (!bodyless) {
+#ifdef KVAR_PRECOMPUTED_LIVE
+        const uint k_live_base = 2u * out_stream;
+        const uint v_live_base = (p.flags & FLAG_SHARED_INDICES) != 0u ?
+            k_live_base : 2u * gl_NumWorkGroups.z + k_live_base;
+        k_live_group = data_live[k_live_base + 0u];
+        k_live_pos = data_live[k_live_base + 1u];
+        v_live_group = data_live[v_live_base + 0u];
+        v_live_pos = data_live[v_live_base + 1u];
+#else
         compute_live(false, stream, lane, k_live_group, k_live_pos);
         if ((p.flags & FLAG_SHARED_INDICES) != 0u) {
             v_live_group = k_live_group;
@@ -405,6 +1294,359 @@ void main() {
         } else {
             compute_live(true, stream, lane, v_live_group, v_live_pos);
         }
+#endif
+    }
+
+    const uint head_dim = head_slices() * KVAR_N_DIM;
+    float accumulator[GQA_GROUP_MAX * KVAR_DIMS_PER_THREAD];
+    for (uint i = 0u; i < GQA_GROUP_MAX * KVAR_DIMS_PER_THREAD; ++i) {
+        accumulator[i] = 0.0;
+    }
+    if (lane == 0u) {
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            sh_maximum[gi] = -3.402823466e38;
+            sh_denominator[gi] = 0.0;
+        }
+    }
+
+    uint n_head_log2 = 1u;
+    while ((n_head_log2 << 1u) <= n_query_heads) {
+        n_head_log2 <<= 1u;
+    }
+    const float m0 = exp2(-p.max_bias / float(n_head_log2));
+    const float m1 = exp2(-(p.max_bias / 2.0) / float(n_head_log2));
+    float slopes[GQA_GROUP_MAX];
+    uint q_bases[GQA_GROUP_MAX];
+    float q_wave_values[GQA_GROUP_MAX * 8u];
+    for (uint gi = 0u; gi < active_heads; ++gi) {
+        const uint query_head = query_head_first + gi;
+        slopes[gi] = p.max_bias > 0.0 ?
+            (query_head < n_head_log2 ?
+                pow(m0, float(query_head + 1u)) :
+                pow(m1, float(2u * (query_head - n_head_log2) + 1u))) : 1.0;
+        q_bases[gi] = query * q_nb1() + query_head * q_nb2() +
+            out_stream * head_dim * n_query() * n_query_heads;
+        for (uint dim = wave_lane; dim < head_dim; dim += 64u) {
+            q_wave_values[gi * 8u + dim / 64u] =
+                uintBitsToFloat(data_q[q_bases[gi] + dim]);
+        }
+    }
+    barrier();
+
+    const uint body_tokens = bodyless ? 0u : p.n_kv;
+    const uint body_divisor = max(n_body_splits, 1u);
+    const bool small_query = n_query() <= 8u;
+    uint token_begin = 0u;
+    uint token_end = 0u;
+    if (process_body) {
+        token_begin = small_query ? split_index * 64u :
+            body_tokens * split_index / body_divisor;
+        token_end = small_query ? min(token_begin + 64u, body_tokens) :
+            body_tokens * (split_index + 1u) / body_divisor;
+    } else if (process_tail) {
+        RunDescRef run_desc = RunDescRef(p.run_desc_addr);
+        const uint desc_base = uint(sh_active) * p.run_desc_ne0;
+        const uint n_tail = uint(max(run_desc.data[desc_base + 4u], 0));
+        const uint tail_split = split_index - n_body_splits;
+        token_begin = tail_split * 64u;
+        token_end = min(token_begin + 64u, n_tail);
+    }
+
+    const uint fast_group = token_begin / KVAR_N_DIM;
+    const bool fast_record = process_body && token_begin < token_end &&
+        token_end <= (fast_group + 1u) * KVAR_N_DIM &&
+        direct_body_record_available(false, fast_group, k_live_group, k_live_pos) &&
+        direct_body_record_available(true, fast_group, v_live_group, v_live_pos);
+    uint k_record_bases[4];
+    uint v_record_bases[4];
+    for (uint slice = 0u; slice < head_slices(); ++slice) {
+        k_record_bases[slice] = direct_record_base(
+            false, stream, fast_group, logical_head, slice);
+        v_record_bases[slice] = direct_record_base(
+            true, stream, fast_group, logical_head, slice);
+    }
+    float k_axis_scale[8];
+    float k_axis_zero[8];
+    float v_axis_other[8];
+    if (fast_record) {
+        for (uint dim = wave_lane; dim < head_dim; dim += 64u) {
+            const uint slice = dim >> 7u;
+            const uint slice_dim = dim & 127u;
+            const uint dim_slot = dim / 64u;
+            k_axis_scale[dim_slot] = load_axis(
+                false, k_record_bases[slice], k_bits() * 512u, 0u, slice_dim);
+            k_axis_zero[dim_slot] = load_axis(
+                false, k_record_bases[slice], k_bits() * 512u, 1u, slice_dim);
+            v_axis_other[dim_slot] = load_axis(
+                true, v_record_bases[slice], v_bits() * 512u, 2u, slice_dim);
+        }
+    }
+
+    for (uint tile_begin = token_begin; tile_begin < token_end;
+            tile_begin += KVAR_TILE_TOKENS) {
+        const uint token = tile_begin + wave;
+        const bool token_valid = token < token_end;
+        uint tail_slot = 0u;
+        if (process_tail && token_valid) {
+            RunDescRef run_desc = RunDescRef(p.run_desc_addr);
+            const uint desc_base = uint(sh_active) * p.run_desc_ne0;
+            tail_slot = uint(run_desc.data[desc_base + 6u + token]);
+        }
+
+        if (fast_record) {
+            if (wave_lane == 0u) {
+                const uint pos = token & 127u;
+                for (uint slice = 0u; slice < head_slices(); ++slice) {
+                    const uint axis_base = (wave * 4u + slice) * 3u;
+                    sh_record_token_axes[axis_base + 0u] = load_axis(
+                        false, k_record_bases[slice], k_bits() * 512u, 2u, pos);
+                    sh_record_token_axes[axis_base + 1u] = load_axis(
+                        true, v_record_bases[slice], v_bits() * 512u, 0u, pos);
+                    sh_record_token_axes[axis_base + 2u] = load_axis(
+                        true, v_record_bases[slice], v_bits() * 512u, 1u, pos);
+                }
+            }
+            barrier();
+        }
+
+        float score_partial[GQA_GROUP_MAX];
+        for (uint gi = 0u; gi < GQA_GROUP_MAX; ++gi) {
+            score_partial[gi] = 0.0;
+        }
+        for (uint dim = wave_lane; dim < head_dim; dim += 64u) {
+            float kval = 0.0;
+            float vval = 0.0;
+            if (token_valid) {
+                if (fast_record) {
+                    const uint slice = dim >> 7u;
+                    const uint slice_dim = dim & 127u;
+                    const uint dim_slot = dim / 64u;
+                    const uint pos = token & 127u;
+                    const uint axis_base = (wave * 4u + slice) * 3u;
+                    const uint k_quant = unpack_record(
+                        false, k_record_bases[slice],
+                        slice_dim * KVAR_N_DIM + pos, k_bits());
+                    const uint v_quant = unpack_record(
+                        true, v_record_bases[slice],
+                        pos * KVAR_N_DIM + slice_dim, v_bits());
+                    kval = (float(k_quant) * k_axis_scale[dim_slot] +
+                        k_axis_zero[dim_slot]) *
+                        sh_record_token_axes[axis_base + 0u];
+                    vval = (float(v_quant) *
+                        sh_record_token_axes[axis_base + 1u] +
+                        sh_record_token_axes[axis_base + 2u]) *
+                        v_axis_other[dim_slot];
+                } else if (process_body) {
+                    const uint slice = dim >> 7u;
+                    const uint slice_dim = dim & 127u;
+                    kval = load_kvarn(false, logical_head, token, stream,
+                        k_live_group, k_live_pos, slice, slice_dim);
+                    vval = load_kvarn(true, logical_head, token, stream,
+                        v_live_group, v_live_pos, slice, slice_dim);
+                } else if (process_tail) {
+                    kval = load_tail(false, tail_slot, logical_head, dim);
+                    vval = load_tail(true, tail_slot, logical_head, dim);
+                }
+            }
+            sh_value_tile[wave * KVAR_MAX_HEAD_DIM + dim] = vval;
+            for (uint gi = 0u; gi < active_heads; ++gi) {
+                score_partial[gi] +=
+                    q_wave_values[gi * 8u + dim / 64u] * kval;
+            }
+        }
+
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            const float total = subgroupAdd(score_partial[gi]);
+            if (wave_lane == 0u) {
+                float mask_value = 0.0;
+                if (token_valid) {
+                    mask_value = process_tail ?
+                        slopes[gi] * load_tail_mask(token, query, out_stream) :
+                        ((p.flags & FLAG_MASK) != 0u ?
+                            slopes[gi] * load_mask(token, query, out_stream) : 0.0);
+                }
+                float score = total * p.scale;
+                if (p.logit_softcap != 0.0) {
+                    score = p.logit_softcap * tanh(score);
+                }
+                score += mask_value;
+                const uint score_index = gi * KVAR_TILE_TOKENS + wave;
+                sh_score_tile[score_index] = score;
+                sh_score_enabled[score_index] = token_valid &&
+                    !(isinf(mask_value) && mask_value < 0.0) ? 1u : 0u;
+            }
+        }
+        barrier();
+
+        if (lane == 0u) {
+            for (uint gi = 0u; gi < active_heads; ++gi) {
+                float next_maximum = sh_maximum[gi];
+                for (uint ti = 0u; ti < KVAR_TILE_TOKENS; ++ti) {
+                    const uint si = gi * KVAR_TILE_TOKENS + ti;
+                    if (sh_score_enabled[si] != 0u) {
+                        next_maximum = max(next_maximum, sh_score_tile[si]);
+                    }
+                }
+                const float old_scale = sh_maximum[gi] < -3.0e38 ?
+                    0.0 : exp(sh_maximum[gi] - next_maximum);
+                float denominator = sh_denominator[gi] * old_scale;
+                for (uint ti = 0u; ti < KVAR_TILE_TOKENS; ++ti) {
+                    const uint si = gi * KVAR_TILE_TOKENS + ti;
+                    const float weight = sh_score_enabled[si] != 0u ?
+                        exp(sh_score_tile[si] - next_maximum) : 0.0;
+                    sh_tile_weight[si] = weight;
+                    denominator += weight;
+                }
+                sh_old_scale[gi] = old_scale;
+                sh_maximum[gi] = next_maximum;
+                sh_denominator[gi] = denominator;
+            }
+        }
+        barrier();
+
+        for (uint dim = lane; dim < head_dim; dim += 256u) {
+            const uint dim_slot = dim / 256u;
+            for (uint gi = 0u; gi < active_heads; ++gi) {
+                float update = 0.0;
+                for (uint ti = 0u; ti < KVAR_TILE_TOKENS; ++ti) {
+                    update += sh_value_tile[ti * KVAR_MAX_HEAD_DIM + dim] *
+                        sh_tile_weight[gi * KVAR_TILE_TOKENS + ti];
+                }
+                const uint ai = gi * KVAR_DIMS_PER_THREAD + dim_slot;
+                accumulator[ai] = accumulator[ai] * sh_old_scale[gi] + update;
+            }
+        }
+        barrier();
+    }
+
+    if (split_k > 1u) {
+        const uint tile_queries = gl_NumWorkGroups.x / split_k;
+        const uint matrix_values = head_dim * tile_queries * n_query_heads *
+            gl_NumWorkGroups.z * split_k;
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            const uint query_head = query_head_first + gi;
+            const uint matrix_base = head_dim * n_query_heads *
+                (split_index + split_k * (local_query + tile_queries * out_stream)) +
+                head_dim * query_head;
+            for (uint dim = lane; dim < head_dim; dim += 256u) {
+                const uint ai = gi * KVAR_DIMS_PER_THREAD + dim / 256u;
+                data_dst[matrix_base + dim] = floatBitsToUint(accumulator[ai]);
+            }
+            if (lane == 0u) {
+                const uint lm_base = matrix_values + n_query_heads * 2u *
+                    (split_index + split_k * (local_query + tile_queries * out_stream));
+                data_dst[lm_base + query_head] = floatBitsToUint(sh_denominator[gi]);
+                data_dst[lm_base + n_query_heads + query_head] = floatBitsToUint(sh_maximum[gi]);
+            }
+        }
+        return;
+    }
+
+    if (lane == 0u) {
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            const uint query_head = query_head_first + gi;
+            if ((p.flags & FLAG_SINKS) != 0u) {
+                const float score = uintBitsToFloat(data_sinks[query_head]);
+                const float next_maximum = max(sh_maximum[gi], score);
+                sh_old_scale[gi] = sh_maximum[gi] < -3.0e38 ?
+                    0.0 : exp(sh_maximum[gi] - next_maximum);
+                sh_denominator[gi] = sh_denominator[gi] * sh_old_scale[gi] +
+                    exp(score - next_maximum);
+                sh_maximum[gi] = next_maximum;
+            } else {
+                sh_old_scale[gi] = 1.0;
+            }
+            sh_weight[gi] = sh_denominator[gi] > 0.0 ?
+                1.0 / sh_denominator[gi] : 0.0;
+        }
+    }
+    barrier();
+
+    for (uint gi = 0u; gi < active_heads; ++gi) {
+        const uint query_head = query_head_first + gi;
+        const uint dst_base = query_head * head_dim +
+            query * head_dim * n_query_heads +
+            out_stream * head_dim * n_query_heads * n_query();
+        for (uint dim = lane; dim < head_dim; dim += 256u) {
+            const uint ai = gi * KVAR_DIMS_PER_THREAD + dim / 256u;
+            data_dst[dst_base + dim] = floatBitsToUint(
+                accumulator[ai] * sh_old_scale[gi] * sh_weight[gi]);
+        }
+    }
+}
+
+#else
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint split_k = max(body_splits() + tail_splits(), 1u);
+    const bool tail_only_dispatch = dispatch_mode() == 2u;
+    const uint dispatch_splits = tail_only_dispatch ?
+        max(tail_splits(), 1u) : split_k;
+    const uint dispatch_split = gl_WorkGroupID.x % dispatch_splits;
+    const uint split_index = tail_only_dispatch ?
+        body_splits() + dispatch_split : dispatch_split;
+    const uint local_query = gl_WorkGroupID.x / dispatch_splits;
+    const uint query = query_base() + local_query;
+    const uint out_stream = gl_WorkGroupID.z;
+    const uint stream = stream_start() + out_stream;
+    const uint n_kv_heads = p.n_heads / head_slices();
+    const uint n_query_heads = n_kv_heads * gqa();
+    const uint gqa_group_size = min(gqa(), GQA_GROUP_MAX);
+    const uint gqa_groups = (gqa() + gqa_group_size - 1u) / gqa_group_size;
+    const uint logical_head = gl_WorkGroupID.y / gqa_groups;
+    const uint gqa_group = gl_WorkGroupID.y % gqa_groups;
+    const uint query_head_first = logical_head * gqa() + gqa_group * gqa_group_size;
+    const uint active_heads = min(
+        gqa_group_size, gqa() - gqa_group * gqa_group_size);
+    const bool has_tail = (p.flags & FLAG_TAIL) != 0u;
+    const bool bodyless = (p.flags & FLAG_TAIL_BODYLESS) != 0u;
+    const uint n_body_splits = body_splits();
+    const uint n_tail_splits = tail_splits();
+    const bool process_body = !bodyless && split_index < n_body_splits;
+    const bool process_tail = has_tail && split_index >= n_body_splits &&
+        split_index < n_body_splits + n_tail_splits;
+
+    if (lane == 0u) {
+        sh_active = -1;
+        if (has_tail) {
+            QueryOrderRef query_order = QueryOrderRef(p.query_order_addr);
+            const int query_id = int(out_stream * n_query() + query);
+            for (uint packed = 0u; packed < p.query_order_nelements; ++packed) {
+                if (query_order.data[packed] == query_id) {
+                    sh_active = int(packed / query_order_ne0());
+                    break;
+                }
+            }
+        }
+    }
+    barrier();
+    if (has_tail && sh_active < 0) {
+        return;
+    }
+
+    uint k_live_group = 0u;
+    uint k_live_pos = 0u;
+    uint v_live_group = 0u;
+    uint v_live_pos = 0u;
+    if (!bodyless) {
+#ifdef KVAR_PRECOMPUTED_LIVE
+        const uint k_live_base = 2u * out_stream;
+        const uint v_live_base = (p.flags & FLAG_SHARED_INDICES) != 0u ?
+            k_live_base : 2u * gl_NumWorkGroups.z + k_live_base;
+        k_live_group = data_live[k_live_base + 0u];
+        k_live_pos = data_live[k_live_base + 1u];
+        v_live_group = data_live[v_live_base + 0u];
+        v_live_pos = data_live[v_live_base + 1u];
+#else
+        compute_live(false, stream, lane, k_live_group, k_live_pos);
+        if ((p.flags & FLAG_SHARED_INDICES) != 0u) {
+            v_live_group = k_live_group;
+            v_live_pos = k_live_pos;
+        } else {
+            compute_live(true, stream, lane, v_live_group, v_live_pos);
+        }
+#endif
     }
 
     float accumulator[GQA_GROUP_MAX * 4u];
@@ -428,6 +1670,7 @@ void main() {
     const uint head_dim = head_slices() * KVAR_N_DIM;
     float slopes[GQA_GROUP_MAX];
     uint q_bases[GQA_GROUP_MAX];
+    float q_values[GQA_GROUP_MAX * 4u];
     for (uint gi = 0u; gi < active_heads; ++gi) {
         const uint query_head = query_head_first + gi;
         slopes[gi] = p.max_bias > 0.0 ?
@@ -437,38 +1680,259 @@ void main() {
         q_bases[gi] = query * q_nb1() +
             query_head * q_nb2() +
             out_stream * head_dim * n_query() * n_query_heads;
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            const uint dim = slice * KVAR_N_DIM + lane;
+            q_values[gi * 4u + slice] =
+                uintBitsToFloat(data_q[q_bases[gi] + dim]);
+        }
     }
 
     const uint body_tokens = bodyless ? 0u : p.n_kv;
-    const uint token_begin = body_tokens * split_index / split_k;
-    const uint token_end = body_tokens * (split_index + 1u) / split_k;
+    const uint body_divisor = max(n_body_splits, 1u);
+    const bool small_query = n_query() <= 8u;
+    const uint body_tiles = (body_tokens + 63u) / 64u;
+    const uint token_begin = process_body ? (small_query ?
+        (body_tiles * split_index / body_divisor) * 64u :
+        body_tokens * split_index / body_divisor) : 0u;
+    const uint token_end = process_body ? (small_query ?
+        min((body_tiles * (split_index + 1u) / body_divisor) * 64u,
+            body_tokens) :
+        body_tokens * (split_index + 1u) / body_divisor) : 0u;
 
-    for (uint token = token_begin; token < token_end; ++token) {
+    bool record_tile_done = false;
+#ifdef KVAR_RECORD_TILE
+    // Decode/short verification: stage the packed record with coalesced loads,
+    // evaluate two tokens concurrently (one per wave64), normalize the whole
+    // 64-token block, then reuse LDS for V.  The split reducer still performs
+    // the global softmax across body and exact-tail partials.
+    const uint tile_group = token_begin / KVAR_N_DIM;
+    const bool record_tile = process_body && small_query &&
+        token_begin < token_end && token_end - token_begin <= 64u &&
+        token_end <= (tile_group + 1u) * KVAR_N_DIM &&
+        direct_body_record_available(false, tile_group, k_live_group, k_live_pos) &&
+        direct_body_record_available(true, tile_group, v_live_group, v_live_pos);
+    if (record_tile) {
+        const uint tile_tokens = token_end - token_begin;
+        for (uint i = lane; i < GQA_GROUP_MAX * 64u;
+                i += gl_WorkGroupSize.x) {
+            sh_block_score[i] = 0.0;
+            sh_block_weight[i] = 0.0;
+            sh_block_enabled[i] = 0u;
+        }
+        barrier();
+
+        const uint wave = gl_SubgroupID;
+        const uint wave_lane = gl_SubgroupInvocationID;
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            const uint record_base = direct_record_base(
+                false, stream, tile_group, logical_head, slice);
+            const uint bits = k_bits();
+            const uint payload_words = bits * 512u;
+            cache_record(false, record_base, payload_words + 192u, lane);
+
+            float q_lo[GQA_GROUP_MAX];
+            float q_hi[GQA_GROUP_MAX];
+            for (uint gi = 0u; gi < active_heads; ++gi) {
+                q_lo[gi] = uintBitsToFloat(data_q[
+                    q_bases[gi] + slice * KVAR_N_DIM + wave_lane]);
+                q_hi[gi] = uintBitsToFloat(data_q[
+                    q_bases[gi] + slice * KVAR_N_DIM + wave_lane + 64u]);
+            }
+            const float k_scale_lo = load_cached_axis(
+                payload_words, 0u, wave_lane);
+            const float k_zero_lo = load_cached_axis(
+                payload_words, 1u, wave_lane);
+            const float k_scale_hi = load_cached_axis(
+                payload_words, 0u, wave_lane + 64u);
+            const float k_zero_hi = load_cached_axis(
+                payload_words, 1u, wave_lane + 64u);
+
+            for (uint local_base = 0u; local_base < tile_tokens;
+                    local_base += gl_NumSubgroups) {
+                const uint local_token = local_base + wave;
+                if (local_token < tile_tokens) {
+                    const uint pos = (token_begin + local_token) & 127u;
+                    const float k_other = load_cached_axis(
+                        payload_words, 2u, pos);
+                    const uint q_lo_bits = unpack_cached_record(
+                        wave_lane * KVAR_N_DIM + pos, bits);
+                    const uint q_hi_bits = unpack_cached_record(
+                        (wave_lane + 64u) * KVAR_N_DIM + pos, bits);
+                    const float kval_lo =
+                        (float(q_lo_bits) * k_scale_lo + k_zero_lo) * k_other;
+                    const float kval_hi =
+                        (float(q_hi_bits) * k_scale_hi + k_zero_hi) * k_other;
+                    for (uint gi = 0u; gi < active_heads; ++gi) {
+                        const float partial = subgroupAdd(
+                            q_lo[gi] * kval_lo + q_hi[gi] * kval_hi);
+                        if (wave_lane == 0u) {
+                            sh_block_score[gi * 64u + local_token] += partial;
+                        }
+                    }
+                }
+            }
+            barrier();
+        }
+
+        // Apply score transforms and obtain one local softmax for this split.
+        for (uint gi = 0u; gi < active_heads; ++gi) {
+            float score = -3.402823466e38;
+            bool enabled = false;
+            if (lane < tile_tokens) {
+                const uint token = token_begin + lane;
+                const float mask_value = (p.flags & FLAG_MASK) != 0u ?
+                    slopes[gi] * load_mask(token, query, out_stream) : 0.0;
+                score = sh_block_score[gi * 64u + lane] * p.scale;
+                if (p.logit_softcap != 0.0) {
+                    score = p.logit_softcap * tanh(score);
+                }
+                score += mask_value;
+                enabled = !(isinf(mask_value) && mask_value < 0.0);
+                sh_block_score[gi * 64u + lane] = score;
+                sh_block_enabled[gi * 64u + lane] = enabled ? 1u : 0u;
+            }
+            const float local_max = subgroupMax(enabled ? score : -3.402823466e38);
+            if (lane == 0u) {
+                sh_maximum[gi] = local_max;
+            }
+            barrier();
+
+            float weight = 0.0;
+            if (lane < tile_tokens && enabled &&
+                    sh_maximum[gi] > -3.0e38) {
+                weight = exp(score - sh_maximum[gi]);
+                sh_block_weight[gi * 64u + lane] = weight;
+            }
+            const float local_sum = subgroupAdd(weight);
+            if (lane == 0u) {
+                sh_denominator[gi] = local_sum;
+            }
+            barrier();
+        }
+
+        // V is token-major in a KVarN record.  Once cached, every lane owns one
+        // output dimension and reuses each dequantized value across all GQA
+        // heads without cross-wave reductions.
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            const uint record_base = direct_record_base(
+                true, stream, tile_group, logical_head, slice);
+            const uint bits = v_bits();
+            const uint payload_words = bits * 512u;
+            cache_record(true, record_base, payload_words + 192u, lane);
+            const float v_other = load_cached_axis(payload_words, 2u, lane);
+            for (uint local_token = 0u; local_token < tile_tokens; ++local_token) {
+                const uint pos = (token_begin + local_token) & 127u;
+                const uint quant = unpack_cached_record(
+                    pos * KVAR_N_DIM + lane, bits);
+                const float value =
+                    (float(quant) * load_cached_axis(payload_words, 0u, pos) +
+                        load_cached_axis(payload_words, 1u, pos)) * v_other;
+                for (uint gi = 0u; gi < active_heads; ++gi) {
+                    const uint acc = gi * 4u + slice;
+                    accumulator[acc] += value *
+                        sh_block_weight[gi * 64u + local_token];
+                }
+            }
+            barrier();
+        }
+        record_tile_done = true;
+    }
+#endif
+
+    // A split can span several records.  Walk it one record at a time so each
+    // sealed record retains the fast path. Partial-record/staged/indirect ranges
+    // use the portable loader.
+    uint token_cursor = token_begin;
+    while (!record_tile_done && token_cursor < token_end) {
+        const uint fast_group = token_cursor / KVAR_N_DIM;
+        const uint record_end = min(token_end, (fast_group + 1u) * KVAR_N_DIM);
+        const bool fast_record =
+            direct_body_record_available(false, fast_group, k_live_group, k_live_pos) &&
+            direct_body_record_available(true, fast_group, v_live_group, v_live_pos);
+        uint k_record_bases[4];
+        uint v_record_bases[4];
+        float k_axis_scale[4];
+        float k_axis_zero[4];
+        float v_axis_other[4];
+        for (uint slice = 0u; slice < head_slices(); ++slice) {
+            const uint k_base = direct_record_base(
+                false, stream, fast_group, logical_head, slice);
+            const uint v_base = direct_record_base(
+                true, stream, fast_group, logical_head, slice);
+            k_record_bases[slice] = k_base;
+            v_record_bases[slice] = v_base;
+            if (fast_record) {
+                k_axis_scale[slice] = load_axis(
+                    false, k_base, k_bits() * 512u, 0u, lane);
+                k_axis_zero[slice] = load_axis(
+                    false, k_base, k_bits() * 512u, 1u, lane);
+                v_axis_other[slice] = load_axis(
+                    true, v_base, v_bits() * 512u, 2u, lane);
+            }
+        }
+
+        for (uint token = token_cursor; token < record_end; ++token) {
         float k_values[4];
         float v_values[4];
-        for (uint slice = 0u; slice < head_slices(); ++slice) {
-            const uint dim = slice * KVAR_N_DIM + lane;
-            k_values[slice] = load_kvarn(false, logical_head, token, stream,
-                k_live_group, k_live_pos, slice, lane);
-            v_values[slice] = load_kvarn(true, logical_head, token, stream,
-                v_live_group, v_live_pos, slice, lane);
+        if (fast_record) {
+            const uint pos = token & 127u;
+            if (gl_SubgroupInvocationID == 0u) {
+                for (uint slice = 0u; slice < head_slices(); ++slice) {
+                    const uint k_base = k_record_bases[slice];
+                    const uint v_base = v_record_bases[slice];
+                    const uint axis_base = (gl_SubgroupID * 4u + slice) * 3u;
+                    sh_record_token_axes[axis_base + 0u] = load_axis(
+                        false, k_base, k_bits() * 512u, 2u, pos);
+                    sh_record_token_axes[axis_base + 1u] = load_axis(
+                        true, v_base, v_bits() * 512u, 0u, pos);
+                    sh_record_token_axes[axis_base + 2u] = load_axis(
+                        true, v_base, v_bits() * 512u, 1u, pos);
+                }
+            }
+            barrier();
+            for (uint slice = 0u; slice < head_slices(); ++slice) {
+                const uint k_base = k_record_bases[slice];
+                const uint v_base = v_record_bases[slice];
+                const uint axis_base = (gl_SubgroupID * 4u + slice) * 3u;
+                const float k_other = sh_record_token_axes[axis_base + 0u];
+                const float v_scale = sh_record_token_axes[axis_base + 1u];
+                const float v_zero = sh_record_token_axes[axis_base + 2u];
+                const uint k_quant = unpack_record(
+                    false, k_base, lane * KVAR_N_DIM + pos, k_bits());
+                const uint v_quant = unpack_record(
+                    true, v_base, pos * KVAR_N_DIM + lane, v_bits());
+                k_values[slice] =
+                    (float(k_quant) * k_axis_scale[slice] + k_axis_zero[slice]) *
+                    k_other;
+                v_values[slice] =
+                    (float(v_quant) * v_scale + v_zero) * v_axis_other[slice];
+            }
+        } else {
+            for (uint slice = 0u; slice < head_slices(); ++slice) {
+                k_values[slice] = load_kvarn(false, logical_head, token, stream,
+                    k_live_group, k_live_pos, slice, lane);
+                v_values[slice] = load_kvarn(true, logical_head, token, stream,
+                    v_live_group, v_live_pos, slice, lane);
+            }
         }
 
         for (uint gi = 0u; gi < active_heads; ++gi) {
             float partial = 0.0;
             for (uint slice = 0u; slice < head_slices(); ++slice) {
                 const uint dim = slice * KVAR_N_DIM + lane;
-                partial += uintBitsToFloat(data_q[q_bases[gi] + dim]) * k_values[slice];
+                partial += q_values[gi * 4u + slice] * k_values[slice];
             }
             partial = subgroupAdd(partial);
             if (gl_SubgroupInvocationID == 0u) {
-                sh_reduce[gl_SubgroupID] = partial;
+                sh_reduce[gi * 8u + gl_SubgroupID] = partial;
             }
-            barrier();
-            if (lane == 0u) {
+        }
+        barrier();
+        if (lane == 0u) {
+            for (uint gi = 0u; gi < active_heads; ++gi) {
                 float total = 0.0;
                 for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
-                    total += sh_reduce[subgroup];
+                    total += sh_reduce[gi * 8u + subgroup];
                 }
                 const float mask_value = (p.flags & FLAG_MASK) != 0u ?
                     slopes[gi] * load_mask(token, query, out_stream) : 0.0;
@@ -491,21 +1955,27 @@ void main() {
                     sh_weight[gi] = weight;
                 }
             }
-            barrier();
-
-            for (uint slice = 0u; slice < head_slices(); ++slice) {
-                const uint acc = gi * 4u + slice;
-                accumulator[acc] = accumulator[acc] * sh_old_scale[gi] +
-                    v_values[slice] * sh_weight[gi];
+        }
+        barrier();
+            for (uint gi = 0u; gi < active_heads; ++gi) {
+                for (uint slice = 0u; slice < head_slices(); ++slice) {
+                    const uint acc = gi * 4u + slice;
+                    accumulator[acc] = accumulator[acc] * sh_old_scale[gi] +
+                        v_values[slice] * sh_weight[gi];
+                }
             }
         }
+        token_cursor = record_end;
     }
 
     if (process_tail) {
         RunDescRef run_desc = RunDescRef(p.run_desc_addr);
         const uint desc_base = uint(sh_active) * p.run_desc_ne0;
         const uint n_tail = uint(max(run_desc.data[desc_base + 4u], 0));
-        for (uint token = 0u; token < n_tail; ++token) {
+        const uint tail_split = split_index - n_body_splits;
+        const uint tail_begin = tail_split * 64u;
+        const uint tail_end = min(tail_begin + 64u, n_tail);
+        for (uint token = tail_begin; token < tail_end; ++token) {
             const uint slot = uint(run_desc.data[desc_base + 6u + token]);
             float k_values[4];
             float v_values[4];
@@ -519,17 +1989,19 @@ void main() {
                 float partial = 0.0;
                 for (uint slice = 0u; slice < head_slices(); ++slice) {
                     const uint dim = slice * KVAR_N_DIM + lane;
-                    partial += uintBitsToFloat(data_q[q_bases[gi] + dim]) * k_values[slice];
+                    partial += q_values[gi * 4u + slice] * k_values[slice];
                 }
                 partial = subgroupAdd(partial);
                 if (gl_SubgroupInvocationID == 0u) {
-                    sh_reduce[gl_SubgroupID] = partial;
+                    sh_reduce[gi * 8u + gl_SubgroupID] = partial;
                 }
-                barrier();
-                if (lane == 0u) {
+            }
+            barrier();
+            if (lane == 0u) {
+                for (uint gi = 0u; gi < active_heads; ++gi) {
                     float total = 0.0;
                     for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
-                        total += sh_reduce[subgroup];
+                        total += sh_reduce[gi * 8u + subgroup];
                     }
                     const float mask_value =
                         slopes[gi] * load_tail_mask(token, query, out_stream);
@@ -552,8 +2024,9 @@ void main() {
                         sh_weight[gi] = weight;
                     }
                 }
-                barrier();
-
+            }
+            barrier();
+            for (uint gi = 0u; gi < active_heads; ++gi) {
                 for (uint slice = 0u; slice < head_slices(); ++slice) {
                     const uint acc = gi * 4u + slice;
                     accumulator[acc] = accumulator[acc] * sh_old_scale[gi] +
@@ -564,12 +2037,13 @@ void main() {
     }
 
     if (split_k > 1u) {
-        const uint matrix_values = head_dim * n_query() * n_query_heads *
+        const uint tile_queries = gl_NumWorkGroups.x / dispatch_splits;
+        const uint matrix_values = head_dim * tile_queries * n_query_heads *
             gl_NumWorkGroups.z * split_k;
         for (uint gi = 0u; gi < active_heads; ++gi) {
             const uint query_head = query_head_first + gi;
             const uint matrix_base = head_dim * n_query_heads *
-                (split_index + split_k * (query + n_query() * out_stream)) +
+                (split_index + split_k * (local_query + tile_queries * out_stream)) +
                 head_dim * query_head;
             for (uint slice = 0u; slice < head_slices(); ++slice) {
                 const uint dim = slice * KVAR_N_DIM + lane;
@@ -577,7 +2051,7 @@ void main() {
             }
             if (lane == 0u) {
                 const uint lm_base = matrix_values + n_query_heads * 2u *
-                    (split_index + split_k * (query + n_query() * out_stream));
+                    (split_index + split_k * (local_query + tile_queries * out_stream));
                 data_dst[lm_base + query_head] = floatBitsToUint(sh_denominator[gi]);
                 data_dst[lm_base + n_query_heads + query_head] = floatBitsToUint(sh_maximum[gi]);
             }
@@ -616,3 +2090,5 @@ void main() {
         }
     }
 }
+
+#endif
