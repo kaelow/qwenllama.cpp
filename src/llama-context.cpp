@@ -3461,50 +3461,96 @@ public:
         cancel();
     }
 
-    void commit() override {
-        llama_memory_buffers mbufs_new;
-
-        for (const auto & rinfo : rinfos) {
-            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
-
-            mbufs_new[buft].n_tensors++;
-            mbufs_new[buft].total_size += rinfo.size;
+    bool prepare_commit() {
+        if (commit_prepared) {
+            return true;
+        }
+        if (buf_size != 0) {
+            return false;
         }
 
-        for (auto & [buft, mbuf] : mbufs_new) {
+        restore_mbufs.clear();
+        for (const auto & rinfo : rinfos) {
+            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+            auto & restore = restore_mbufs[buft];
+            restore.n_tensors++;
+            restore.total_size += rinfo.size;
+        }
+
+        for (auto & [buft, restore] : restore_mbufs) {
+            const auto it = mbufs.find(buft);
+            if (it == mbufs.end()) {
+                restore_mbufs.clear();
+                return false;
+            }
+            const auto & saved = it->second;
+            if (!saved.buf || saved.n_tensors != restore.n_tensors ||
+                    saved.total_size != restore.total_size ||
+                    saved.cpy.size() != size_t(restore.n_tensors)) {
+                restore_mbufs.clear();
+                return false;
+            }
+
             ggml_init_params params = {
-                /*.mem_size   =*/ mbuf.n_tensors*ggml_tensor_overhead(),
+                /*.mem_size   =*/ size_t(restore.n_tensors)*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
-
-            mbuf.ctx.reset(ggml_init(params));
-
-            mbuf.org.reserve(mbuf.n_tensors);
+            restore.ctx.reset(ggml_init(params));
+            if (!restore.ctx) {
+                restore_mbufs.clear();
+                return false;
+            }
+            restore.org.reserve(restore.n_tensors);
         }
 
+        std::map<ggml_backend_buffer_type_t, size_t> indices;
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+            const auto saved_it = mbufs.find(buft);
+            GGML_ASSERT(saved_it != mbufs.end());
 
-            GGML_ASSERT(rinfo.size % ggml_type_size(rinfo.tensor->type) == 0);
-            const int64_t n = (rinfo.size/ggml_type_size(rinfo.tensor->type))*ggml_blck_size(rinfo.tensor->type);
-
-            auto & mbuf = mbufs_new[buft];
-
-            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset));
-
-            ggml_backend_view_init(mbuf.org.back());
-        }
-
-        for (auto & [buft, mbuf] : mbufs_new) {
-            const auto & mbuf_cur = mbufs.at(buft);
-
-            if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
-                GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+            const size_t i = indices[buft]++;
+            const auto & saved = saved_it->second;
+            const size_t tensor_size = ggml_nbytes(rinfo.tensor);
+            if (i >= saved.cpy.size() ||
+                    rinfo.offset > tensor_size || rinfo.size > tensor_size - rinfo.offset ||
+                    rinfo.size % ggml_type_size(rinfo.tensor->type) != 0 ||
+                    saved.cpy[i]->type != rinfo.tensor->type ||
+                    ggml_nbytes(saved.cpy[i]) != rinfo.size) {
+                restore_mbufs.clear();
+                return false;
             }
 
-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+            const int64_t n = (rinfo.size/ggml_type_size(rinfo.tensor->type))*
+                    ggml_blck_size(rinfo.tensor->type);
+            auto & restore = restore_mbufs.at(buft);
+            restore.org.push_back(ggml_view_1d(
+                    restore.ctx.get(), rinfo.tensor, n, rinfo.offset));
+            ggml_backend_view_init(restore.org.back());
+        }
+
+        commit_prepared = true;
+        return true;
+    }
+
+    void commit() override {
+        // Direct state loads prepare here. Transactional users call
+        // prepare_commit() while constructing the restore plan, leaving this
+        // commit path allocation-free and no-fail.
+        if (!prepare_commit()) {
+            throw std::runtime_error("on-device sequence state is incompatible with the restore destination");
+        }
+
+        for (const auto & [buft, restore] : restore_mbufs) {
+            const auto & mbuf_cur = mbufs.at(buft);
+
+            GGML_ASSERT(mbuf_cur.buf && mbuf_cur.n_tensors == restore.n_tensors &&
+                    mbuf_cur.total_size == restore.total_size &&
+                    mbuf_cur.cpy.size() == restore.org.size());
+
+            for (size_t i = 0; i < restore.org.size(); ++i) {
+                ggml_backend_tensor_copy(mbuf_cur.cpy[i], restore.org[i]);
             }
         }
 
@@ -3556,6 +3602,8 @@ public:
         rinfos.clear();
         host_operations.clear();
         callbacks.clear();
+        restore_mbufs.clear();
+        commit_prepared = false;
     }
 
     size_t n_bytes() override {
@@ -3586,6 +3634,8 @@ private:
     std::vector<std::function<void()>> callbacks;
 
     const llama_memory_buffers & mbufs;
+    llama_memory_buffers restore_mbufs;
+    bool commit_prepared = false;
 };
 
 struct llama_state_seq_restore_plan {
@@ -3738,7 +3788,6 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 llama_state_seq_restore_plan * llama_context::state_seq_prepare_data(
         llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     if (src == nullptr || size == 0 ||
-            (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) != 0 ||
             seq_id < 0 || uint32_t(seq_id) >= cparams.n_seq_max ||
             !memory || !memory->state_seq_can_restore(seq_id, flags)) {
         return nullptr;
@@ -3746,7 +3795,32 @@ llama_state_seq_restore_plan * llama_context::state_seq_prepare_data(
 
     try {
         auto plan = std::make_unique<llama_state_seq_restore_plan>();
-        plan->io = std::make_unique<llama_io_read_host>(src, size);
+        llama_io_read_device * device_io = nullptr;
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+            // The byte vector contains only the portable metadata envelope;
+            // tensor payloads live in the context-owned device checkpoint for
+            // the source sequence recorded in that envelope.
+            llama_io_read_host header(src, size);
+            uint32_t magic_read;
+            header.read(&magic_read, sizeof(magic_read));
+            if (io_magic != magic_read) {
+                throw std::runtime_error("wrong sequence state magic");
+            }
+
+            llama_seq_id seq_id_read;
+            header.read(&seq_id_read, sizeof(seq_id_read));
+            const auto storage = mem_storage.find(seq_id_read);
+            if (storage == mem_storage.end()) {
+                throw std::runtime_error("missing on-device sequence state storage");
+            }
+
+            auto io = std::make_unique<llama_io_read_device>(
+                    src, size, storage->second);
+            device_io = io.get();
+            plan->io = std::move(io);
+        } else {
+            plan->io = std::make_unique<llama_io_read_host>(src, size);
+        }
 
         uint32_t magic_read;
         plan->io->read(&magic_read, sizeof(magic_read));
@@ -3761,6 +3835,9 @@ llama_state_seq_restore_plan * llama_context::state_seq_prepare_data(
         plan->bytes = state_seq_read_data(*plan->io, seq_id, flags);
         if (plan->bytes != size) {
             throw std::runtime_error("sequence state contains trailing or missing bytes");
+        }
+        if (device_io != nullptr && !device_io->prepare_commit()) {
+            throw std::runtime_error("on-device sequence state is incompatible with the restore destination");
         }
         return plan.release();
     } catch (const std::exception & err) {

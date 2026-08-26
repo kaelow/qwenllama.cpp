@@ -47,6 +47,17 @@ static constexpr llama_state_seq_flags SERVER_SPECULATIVE_CHECKPOINT_FLAGS =
         LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
         LLAMA_STATE_SEQ_FLAGS_RECURRENT_ONLY;
 
+static llama_state_seq_flags server_speculative_checkpoint_flags(
+        common_speculative_type source) {
+    // ngram-mod checkpoints are single-use and are always restored into the
+    // same live slot. Keep their recurrent tensors on the device; only the
+    // small metadata envelope lives in common_prompt_checkpoint. Durable
+    // prompt checkpoints remain host-backed and independently reusable.
+    return source == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ?
+        SERVER_SPECULATIVE_CHECKPOINT_FLAGS | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE :
+        SERVER_SPECULATIVE_CHECKPOINT_FLAGS;
+}
+
 static bool server_reasoning_budget_state_is_reasoning(common_reasoning_budget_state state) {
     return state == REASONING_BUDGET_COUNTING ||
            state == REASONING_BUDGET_WAITING_UTF8 ||
@@ -250,6 +261,8 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    size_t spec_replay_n_draft = 0;
+    size_t spec_replay_n_accepted = 0;
     bool spec_disabled = false;
     bool spec_recovery_active = false;
     server_tokens spec_recovery_prompt;
@@ -421,6 +434,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_replay_n_draft = 0;
+        spec_replay_n_accepted = 0;
         spec_disabled = false;
         spec_recovery_active = false;
         spec_recovery_prompt.clear();
@@ -579,7 +594,26 @@ struct server_slot {
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
-        if (spec_draft.empty()) {
+        if (spec_is_replay) {
+            // The checkpoint path already sampled and accepted this output.
+            // Rebuild only the target memory state: sampled is the uncached
+            // anchor, spec_draft[0..end-1) is the accepted n-gram prefix, and
+            // spec_draft.back() is the correction token that remains pending.
+            // No logits are required for this deterministic replay.
+            GGML_ASSERT(!spec_draft.empty());
+
+            auto pos0 = prompt.tokens.pos_next();
+            add_ok &= batch.add(id, sampled, pos0++, false, false);
+            for (auto it = spec_draft.begin(); it != spec_draft.end() - 1; ++it) {
+                add_ok &= batch.add(id, *it, pos0++, false, false);
+            }
+            i_batch = batch.size() - 1;
+
+            SLT_DBG(*this,
+                    "replay accepted ngram prefix: anchor=%d cached=%zu pending=%d pos_next=%d\n",
+                    sampled, spec_draft.size() - 1, spec_draft.back(),
+                    prompt.tokens.pos_next());
+        } else if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
 
@@ -613,7 +647,11 @@ struct server_slot {
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
 
         prompt.tokens.push_back(sampled);
-        prompt.tokens.insert(spec_draft);
+        if (spec_is_replay) {
+            prompt.tokens.insert({ spec_draft.begin(), spec_draft.end() - 1 });
+        } else {
+            prompt.tokens.insert(spec_draft);
+        }
     }
 
     void release() {
@@ -2059,6 +2097,8 @@ private:
         slot.spec_draft.clear();
         slot.spec_i_batch.clear();
         slot.spec_is_replay = false;
+        slot.spec_replay_n_draft = 0;
+        slot.spec_replay_n_accepted = 0;
 
         // The sampled token immediately after this boundary has already been
         // emitted and accepted by the sampler, but has not yet been committed
@@ -3460,6 +3500,11 @@ private:
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
+                            /* .costly_rollback = */
+                                server_speculative_rollback_requires_checkpoint(
+                                    ctx_tgt_seq_rm_type,
+                                    common_context_seq_rm_max_rollback(ctx_tgt),
+                                    size_t(n_draft_max)),
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
@@ -3502,6 +3547,7 @@ private:
 
             slot.stats.n_draft_tokens += draft.size();
             const auto draft_source = common_speculative_last_type(spec.get(), slot.id);
+            const auto checkpoint_flags = server_speculative_checkpoint_flags(draft_source);
             SLT_TRC(slot,
                     "spec-draft source=%s proposed=%zu cache-pos=[%d,%d] "
                     "native-capacity=[target=%u,draft=%u]\n",
@@ -3552,7 +3598,7 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     const auto capture = ckpt.update_tgt(
-                            ctx_tgt, slot.id, SERVER_SPECULATIVE_CHECKPOINT_FLAGS);
+                            ctx_tgt, slot.id, checkpoint_flags);
                     if (!capture.ok()) {
                         SLT_WRN(slot, "failed to capture target speculative checkpoint (status = %d, bytes = %zu)\n",
                                 int(capture.status), capture.bytes);
@@ -3576,7 +3622,7 @@ private:
 
                 if (use_ckpt_dft) {
                     const auto capture = ckpt.update_dft(
-                            ctx_dft, slot.id, SERVER_SPECULATIVE_CHECKPOINT_FLAGS);
+                            ctx_dft, slot.id, checkpoint_flags);
                     if (!capture.ok()) {
                         SLT_WRN(slot, "failed to capture draft speculative checkpoint (status = %d, bytes = %zu)\n",
                                 int(capture.status), capture.bytes);
@@ -4321,13 +4367,19 @@ private:
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
         }
+        const bool completes_ngram_replay = std::any_of(
+                slots.begin(), slots.end(), [&](const server_slot & slot) {
+                    return slot.spec_is_replay &&
+                           slot.i_batch >= off &&
+                           slot.i_batch < off + batch_view.n_tokens;
+                });
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
+            if (ret == 0 && (has_output || completes_ngram_replay)) {
                 llama_synchronize(ctx_tgt);
             }
         });
@@ -4382,7 +4434,9 @@ private:
             return false; // retry with the updated n_batch
         } else {
             // success, apply batch metrics
-            metrics_post_decode(off, batch_view.n_tokens, has_output);
+            metrics_post_decode(
+                    off, batch_view.n_tokens,
+                    has_output || completes_ngram_replay);
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -4415,6 +4469,23 @@ private:
                         continue;
                     }
                     const auto source = common_speculative_last_type(spec.get(), slot.id);
+                    if (slot.spec_is_replay) {
+                        SLT_TRC(slot,
+                                "spec-process source=%s proposed=%zu "
+                                "fallback=auxiliary-process-failed "
+                                "action=finish-ngram-replay-with-speculation-disabled\n",
+                                common_speculative_type_to_str(source).c_str(),
+                                slot.spec_replay_n_draft);
+                        slot.spec_disabled = true;
+                        common_speculative_get_draft_params(
+                                spec.get(), slot.id).drafting = false;
+                        slot.spec_i_batch.clear();
+                        if (ctx_dft && !llama_memory_seq_rm(
+                                    llama_get_memory(ctx_dft), slot.id, -1, -1)) {
+                            SLT_ERR(slot, "%s", "failed to clear draft sequence after replay process failure\n");
+                        }
+                        continue;
+                    }
                     SLT_TRC(slot,
                             "spec-process source=%s proposed=%zu "
                             "fallback=auxiliary-process-failed action=disable-speculation\n",
@@ -4551,6 +4622,69 @@ private:
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+
+            if (slot.spec_is_replay) {
+                // A rejected ngram-mod batch has already been sampled. This
+                // decode rebuilt the cache/recurrent state only, without an
+                // output projection. Commit the known accepted prefix and
+                // leave its correction token pending for the next ordinary or
+                // speculative decode.
+                GGML_ASSERT(!slot.spec_draft.empty());
+                GGML_ASSERT(slot.spec_replay_n_accepted + 1 == slot.spec_draft.size());
+
+                const size_t n_draft = slot.spec_replay_n_draft;
+                const size_t n_accepted = slot.spec_replay_n_accepted;
+                const auto ids = std::move(slot.spec_draft);
+
+                slot.sampled = ids.back();
+                slot.i_batch = -1;
+                slot.spec_is_replay = false;
+                slot.spec_replay_n_draft = 0;
+                slot.spec_replay_n_accepted = 0;
+                slot.spec_ckpt.clear();
+
+                slot.stats.update_gen_last();
+                slot.stats.n_draft_accepted += n_accepted;
+                slot.stats.n_draft_verif_steps += 1;
+
+                auto & n_accepted_per_pos = slot.n_accepted_per_pos;
+                if (n_accepted_per_pos.empty()) {
+                    n_accepted_per_pos.resize(
+                            common_speculative_n_max(&params_base.speculative), 0);
+                }
+                for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
+                    n_accepted_per_pos[i]++;
+                }
+
+                SLT_TRC(slot,
+                        "spec-replay source=ngram-mod proposed=%zu accepted=%zu "
+                        "cached=%zu emitted=%zu logits=0 route=checkpoint\n",
+                        n_draft, n_accepted, ids.size() - 1, ids.size());
+
+                for (const llama_token id : ids) {
+                    completion_token_output result;
+                    result.tok = id;
+                    result.text_to_send = common_token_to_piece(
+                            slot.ctx_tgt, result.tok,
+                            accept_special_token(slot, result.tok));
+                    result.prob = 1.0f;
+
+                    slot.stats.n_gen += 1;
+
+                    if (!process_token(result, slot)) {
+                        slot.print_timings();
+                        send_final_response(slot);
+                        slot.release();
+                        return;
+                    }
+                }
+
+                slot.print_timings_tg();
+                SLT_DBG(slot,
+                        "replayed accepted ngram prefix: accepted=%zu/%zu new n_tokens=%d\n",
+                        n_accepted, n_draft, slot.prompt.n_tokens());
                 return;
             }
 
@@ -4708,6 +4842,8 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.spec_replay_n_draft = n_draft;
+                        slot.spec_replay_n_accepted = accepted.size() - 1;
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -4727,7 +4863,8 @@ private:
 
                         if (!restore_checkpoint_transaction(
                                     slot, ckpt, slot.ctx_tgt, slot.ctx_dft,
-                                    true, use_ckpt_dft, true, SERVER_SPECULATIVE_CHECKPOINT_FLAGS)) {
+                                    true, use_ckpt_dft, true,
+                                    server_speculative_checkpoint_flags(draft_source))) {
                             SLT_ERR(slot, "%s", "failed to restore speculative checkpoint transaction\n");
                             restore_verification_state();
                             schedule_speculative_target_only_replay(
@@ -4745,6 +4882,23 @@ private:
                         }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+
+                        if (draft_source == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
+                            // The target already determined the accepted prefix
+                            // and correction token. Preserve that sampler/loop-
+                            // guard state, report the real n-gram acceptance once,
+                            // and rebuild only the recurrent/KV memory on the next
+                            // decode. The old path restored the sampler and ran a
+                            // second all-logits speculative verification.
+                            common_speculative_accept(
+                                    spec.get(), slot.id,
+                                    uint16_t(slot.spec_replay_n_accepted));
+                            return;
+                        }
+
+                        // Other speculative implementations retain upstream's
+                        // verification replay until their implementation state
+                        // has an equivalent no-logits recovery contract.
                         restore_verification_state();
 
                         return;
@@ -4769,6 +4923,8 @@ private:
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+            slot.spec_replay_n_draft = 0;
+            slot.spec_replay_n_accepted = 0;
 
             slot.stats.update_gen_last();
 

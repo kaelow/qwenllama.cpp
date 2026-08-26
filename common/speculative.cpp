@@ -1926,8 +1926,16 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
 
-        // consecutive accept rounds with low acceptance fraction (< 0.5)
+        // ngram-mod can be very profitable on an exact repeated span, but a
+        // long miss is expensive on recurrent targets: restoring their state
+        // may require replaying the accepted prefix.  Start at a useful batch
+        // size, promote quickly after complete matches, and back off locally
+        // after a miss instead of clearing the shared table.
+        size_t adaptive_max = 0;
+        uint32_t n_bad = 0;
+        uint32_t cooldown = 0;
         int n_low = 0;
+        bool costly_rollback = false;
     };
 
     std::vector<seq_info> sinfos;
@@ -1960,6 +1968,16 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.n_bad = 0;
+        sinfo.cooldown = 0;
+        sinfo.n_low = 0;
+        sinfo.costly_rollback = false;
+
+        const size_t configured_max = std::max(0, params.n_max);
+        const size_t configured_min = std::min(
+                configured_max, size_t(std::max(1, params.n_min)));
+        sinfo.adaptive_max = std::min(
+                configured_max, std::max(configured_min, size_t(16)));
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -2000,6 +2018,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         const size_t n = mod.get_n();
 
+        sinfo.costly_rollback = dparams.costly_rollback;
+
         // add new ngrams in chunks
         if (sinfo.i_last + 32 < cur_len) {
             for (size_t i = sinfo.i_last; i < cur_len - n; ++i) {
@@ -2009,16 +2029,37 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
-        result.resize(n + params.n_max);
+        if (sinfo.costly_rollback && sinfo.cooldown > 0) {
+            --sinfo.cooldown;
+            SPC_TRC("ngram_mod seq=%d cooling down, remaining=%u adaptive-max=%zu\n",
+                    (int) seq_id, sinfo.cooldown, sinfo.adaptive_max);
+            return;
+        }
+
+        size_t n_limit = size_t(std::max(0, params.n_max));
+        if (dparams.n_max > 0) {
+            n_limit = std::min(n_limit, size_t(dparams.n_max));
+        }
+        if (sinfo.costly_rollback && sinfo.adaptive_max > 0) {
+            n_limit = std::min(n_limit, sinfo.adaptive_max);
+        }
+        if (n_limit == 0) {
+            return;
+        }
+
+        const size_t n_required = std::min(
+                n_limit, size_t(std::max(0, params.n_min)));
+
+        result.resize(n + n_limit);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
         }
         result[n - 1] = dparams.id_last;
 
-        for (int i = 0; i < params.n_max; ++i) {
+        for (size_t i = 0; i < n_limit; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
-                if (i < params.n_min) {
+                if (i < n_required) {
                     result.clear();
                     return;
                 }
@@ -2064,16 +2105,21 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         auto & sinfo = sinfos[seq_id];
 
-        // compute acceptance fraction if we have a recorded draft length
-        if (sinfo.n_draft_last > 0) {
-            const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
+        if (sinfo.n_draft_last == 0) {
+            return;
+        }
+
+        const size_t proposed = sinfo.n_draft_last;
+        const size_t accepted = std::min<size_t>(n_accepted, proposed);
+
+        if (!sinfo.costly_rollback) {
+            const double f_acc = double(accepted) / double(proposed);
             if (f_acc < 0.25) {
                 sinfo.n_low++;
                 if (sinfo.n_low >= 5) {
                     if (verbose) {
                         SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
                     }
-
                     mod.reset();
                     sinfo.n_low = 0;
                     sinfo.i_last = 0;
@@ -2081,6 +2127,54 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             } else {
                 sinfo.n_low = 0;
             }
+            return;
+        }
+
+        const size_t rejected = proposed - accepted;
+        const size_t configured_max = size_t(std::max(0, params.n_max));
+        const size_t configured_min = std::min(
+                configured_max, size_t(std::max(1, params.n_min)));
+        const size_t old_max = sinfo.adaptive_max;
+
+        if (rejected <= 2) {
+            // Complete and near-complete matches need no checkpoint on the
+            // common two-snapshot recurrent configuration.  Promote rapidly
+            // so long repeated spans still reach the configured 32/64-token
+            // fast path after a single successful probe.
+            sinfo.n_bad = 0;
+            sinfo.cooldown = 0;
+            if (accepted == proposed && sinfo.adaptive_max < configured_max) {
+                sinfo.adaptive_max = std::min(
+                        configured_max, std::max(sinfo.adaptive_max + size_t(8),
+                                                sinfo.adaptive_max * size_t(2)));
+            }
+        } else if (accepted * 2 >= proposed) {
+            // A useful but truncated match should be retried at approximately
+            // the observed useful prefix, with two tokens of tolerance for a
+            // native rollback.  Eight-token buckets avoid pipeline churn.
+            sinfo.n_bad = 0;
+            sinfo.cooldown = 0;
+            const size_t observed = ((accepted + 2 + 7) / 8) * 8;
+            sinfo.adaptive_max = std::max(
+                    configured_min, std::min(old_max, observed));
+        } else {
+            // Poor predictions are negative-profit at long context.  Reduce
+            // their worst-case verification/replay span and briefly yield to
+            // the next configured source (MTP) or ordinary target decoding.
+            sinfo.n_bad = std::min<uint32_t>(sinfo.n_bad + 1, 4);
+            const size_t observed = ((accepted + 2 + 7) / 8) * 8;
+            sinfo.adaptive_max = std::max(
+                    configured_min, std::min(old_max, std::max(size_t(1), observed)));
+
+            const bool severe = accepted * 4 < proposed;
+            sinfo.cooldown = severe ? (uint32_t(1) << sinfo.n_bad) : 1u;
+            sinfo.cooldown = std::min<uint32_t>(sinfo.cooldown, 16);
+        }
+
+        if (verbose || sinfo.adaptive_max != old_max || sinfo.cooldown > 0) {
+            SPC_TRC("ngram_mod seq=%d accepted=%zu/%zu adaptive-max=%zu->%zu cooldown=%u\n",
+                    (int) seq_id, accepted, proposed, old_max,
+                    sinfo.adaptive_max, sinfo.cooldown);
         }
     }
 };

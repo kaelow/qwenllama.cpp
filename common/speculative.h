@@ -52,6 +52,11 @@ struct common_speculative_draft_params {
     // can be used to constraint the max draft based on the remaining context size
     int32_t n_max = -1;
 
+    // The target can remove only a bounded suffix and may need checkpoint
+    // replay after a rejection. Cheap/arbitrary rollback keeps the upstream
+    // n-gram horizon behavior.
+    bool costly_rollback = false;
+
     llama_pos   n_past;
     llama_token id_last;
 
