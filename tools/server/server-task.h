@@ -8,6 +8,7 @@
 #include <functional>
 #include <unordered_set>
 #include <list>
+#include <limits>
 #include <map>
 #include <numeric>
 
@@ -656,10 +657,13 @@ static inline server_prompt_reuse_plan server_prompt_plan_reuse(
         const server_tokens & requested,
         int32_t reuse_alignment,
         size_t native_restorable_tokens,
-        bool self_contained) {
+        bool self_contained,
+        size_t lexical_token_limit = std::numeric_limits<size_t>::max(),
+        llama_pos checkpoint_pos_min_threshold = std::numeric_limits<llama_pos>::max()) {
     const int32_t alignment = std::max(1, reuse_alignment);
     server_prompt_reuse_plan result;
-    result.lexical_tokens = prompt.tokens.get_common_prefix(requested);
+    result.lexical_tokens = std::min(
+            prompt.tokens.get_common_prefix(requested), lexical_token_limit);
     result.restorable_tokens = std::min(result.lexical_tokens, native_restorable_tokens);
     if (result.restorable_tokens > 0) {
         result.reason = SERVER_PROMPT_REUSE_NATIVE;
@@ -677,12 +681,24 @@ static inline server_prompt_reuse_plan server_prompt_plan_reuse(
                 checkpoint.n_tokens <= int64_t(result.lexical_tokens) &&
                 checkpoint.n_tokens%alignment == 0 &&
                 checkpoint.pos_max <= requested_p0 &&
+                (checkpoint.pos_min == 0 ||
+                 checkpoint.pos_min < checkpoint_pos_min_threshold) &&
                 size_t(checkpoint.n_tokens) > result.restorable_tokens) {
             result.restorable_tokens = size_t(checkpoint.n_tokens);
             result.reason = SERVER_PROMPT_REUSE_CHECKPOINT;
         }
     }
     return result;
+}
+
+static inline const char * server_prompt_reuse_reason_name(server_prompt_reuse_reason reason) {
+    switch (reason) {
+        case SERVER_PROMPT_REUSE_NONE:           return "none";
+        case SERVER_PROMPT_REUSE_NATIVE:         return "native";
+        case SERVER_PROMPT_REUSE_CHECKPOINT:     return "checkpoint";
+        case SERVER_PROMPT_REUSE_SELF_CONTAINED: return "self_contained";
+    }
+    return "unknown";
 }
 
 struct server_prompt_cache_state_io {
