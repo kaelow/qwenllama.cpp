@@ -12041,6 +12041,28 @@ static uint32_t ggml_vk_kvarn_dispatch_query_tile(
             (query_tile / cooperative_query_pack) * cooperative_query_pack);
 }
 
+static uint32_t ggml_vk_kvarn_coop_query_pack(
+        const ggml_tensor * q,
+        uint32_t gqa,
+        bool cooperative_route) {
+    if (!cooperative_route || q->ne[3] != 1) {
+        return 1u;
+    }
+
+    const uint32_t queries_per_matrix = std::max(1u, 16u / gqa);
+    if (q->ne[1] > 8 && q->ne[0] == 256 && gqa == 6) {
+        // Qwen D256/GQA6 can fit two queries in each cooperative matrix.  The
+        // former six-query specialization kept three query/accumulator planes
+        // live for the complete KVarN record scan.  On RDNA3 that private state
+        // spills at long context and makes every prefill microbatch progressively
+        // memory-bound.  Two matrix batches retain K/V reuse across four queries
+        // while keeping the shader's register footprint bounded.
+        return 2u * queries_per_matrix;
+    }
+
+    return queries_per_matrix;
+}
+
 static size_t ggml_vk_kvarn_attention_split_workspace_size(
         const vk_device & device,
         const ggml_tensor * dst) {
@@ -12080,13 +12102,8 @@ static size_t ggml_vk_kvarn_attention_split_workspace_size(
         (q->ne[0] == 128 || q->ne[0] == 256 || q->ne[0] == 512) &&
         gqa <= 16 && !k_side.swa && !v_side.swa &&
         !k_side.read_indirect && !v_side.read_indirect;
-    uint32_t planned_query_pack = 1u;
-    if (cooperative_route && q->ne[3] == 1) {
-        planned_query_pack = std::max(1u, 16u / gqa);
-        if (q->ne[1] > 8 && q->ne[0] == 256 && gqa == 6) {
-            planned_query_pack = 6u;
-        }
-    }
+    const uint32_t planned_query_pack = ggml_vk_kvarn_coop_query_pack(
+        q, gqa, cooperative_route);
     const auto route = ggml_vk_fattn_kvarn_plan({
         bodyless ? 0u : uint32_t(dst->src[1]->ne[1]),
         uint32_t(q->ne[1]),
@@ -12260,13 +12277,8 @@ static bool ggml_vk_flash_attn_kvarn(
         (q->ne[0] == 128 || q->ne[0] == 256 || q->ne[0] == 512) &&
         gqa <= 16 && coop_workspace_fits &&
         coop_pipeline_available;
-    uint32_t planned_coop_query_pack = 1u;
-    if (use_coopmat && q->ne[3] == 1) {
-        planned_coop_query_pack = std::max(1u, 16u / gqa);
-        if (q->ne[1] > 8 && q->ne[0] == 256 && gqa == 6) {
-            planned_coop_query_pack = 6u;
-        }
-    }
+    const uint32_t planned_coop_query_pack = ggml_vk_kvarn_coop_query_pack(
+        q, gqa, use_coopmat);
     const bool bodyless = (flags & 512u) != 0u;
     // Prefill already keeps its body numerator and softmax statistics live
     // across many 64-token tiles. Reuse that online loop for the exact tail:

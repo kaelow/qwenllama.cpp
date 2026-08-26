@@ -712,6 +712,9 @@ void main() {
     // Cache this invocation's query element for every 16-wide dimension slice.
     // Reusing it across all body tiles avoids rereading the query tensor once
     // per record, which matters increasingly as the populated context grows.
+    // Keep KVAR_COOPMAT_MATRIX_BATCHES small: these are private arrays held for
+    // the entire record loop, so increasing the batch count can turn both into
+    // scratch traffic and make prefill cost scale pathologically with context.
     float16_t query_cache[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
     float accumulator[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
     for (uint i = 0u; i < COOPMAT_MATRIX_BATCHES * COOPMAT_DIM_BLOCKS; ++i) {
