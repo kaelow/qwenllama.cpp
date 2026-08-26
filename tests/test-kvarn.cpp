@@ -186,7 +186,7 @@ static void test_vulkan_decode_route_policy() {
 
     const auto coalesced_prefill = ggml_vk_fattn_kvarn_plan({
         19488, 512, 24, 4, 1, 96, 640, 256,
-        128ull * 1024ull * 1024ull, 16, false, 6, 0, true,
+        128ull * 1024ull * 1024ull, 16, false, 8, 0, true,
     });
     require(coalesced_prefill.body_splits == 1 &&
             coalesced_prefill.tail_splits == 1 &&
@@ -199,9 +199,9 @@ static void test_vulkan_decode_route_policy() {
 
     const auto packed_small_prefill = ggml_vk_fattn_kvarn_plan({
         19488, 64, 24, 4, 1, 96, 128, 256,
-        128ull * 1024ull * 1024ull, 16, false, 6,
+        128ull * 1024ull * 1024ull, 16, false, 8,
     });
-    require(packed_small_prefill.body_splits >= 5,
+    require(packed_small_prefill.body_splits == 6,
             "packed cooperative queries under-filled the RDNA3 split planner");
     require(packed_small_prefill.workspace_supported &&
             packed_small_prefill.workspace_bytes <= 128ull * 1024ull * 1024ull,
@@ -3829,6 +3829,22 @@ static void test_native_flash_attention_prefill_route_parity() {
             return;
         }
     }
+
+    // The D256/GQA6 specialization packs query-head rows continuously across
+    // three 16-row cooperative matrices.  Seventeen queries cover two full
+    // eight-query workgroups and one partial workgroup, including queries that
+    // straddle matrix boundaries.  Compare against materialized K/V rather
+    // than another native route so a shared row-mapping error cannot pass.
+    const std::vector<float> dense_row_reference = test_native_flash_attention_output(
+            gpu_backend, false, false, 256, 5, 5, 17, 6, 1,
+            512, 3, false, nullptr, false, 128, false,
+            GGML_TYPE_F16, 0, false, true);
+    const std::vector<float> dense_row_native = test_native_flash_attention_output(
+            gpu_backend, true, true, 256, 5, 5, 17, 6, 1,
+            512, 3, false, nullptr, false, 128, false,
+            GGML_TYPE_F16, 0, false, true);
+    require_close_f32_rmse(dense_row_native, dense_row_reference, 1e-2f,
+            "dense-row D256/GQA6 prefill differs from the materialized K/V reference");
 
     const auto require_route_parity = [&](int bits, int n_kv, int tail_candidates, const char * message) {
         const std::vector<float> windowed = test_native_flash_attention_output(

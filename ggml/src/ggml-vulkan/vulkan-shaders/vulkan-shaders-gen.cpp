@@ -1047,6 +1047,8 @@ void process_shaders() {
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("fwht_f32", "fwht.comp", {});
     string_to_spv("kvarn_store", "kvarn_store.comp", {});
     string_to_spv("kvarn_materialize", "kvarn_materialize.comp", {});
@@ -1082,11 +1084,13 @@ void process_shaders() {
             {{"KVAR_COOPMAT", "1"}, {"KVAR_COOPMAT_PREFILL", "1"},
              {"KVAR_PRECOMPUTED_LIVE", "1"}, {"KVAR_GQA_GROUP_MAX", "16"},
              {"KVAR_HEAD_DIM", "256"}, {"KVAR_COOPMAT_DIM_BLOCKS", "16"},
-             // Six D256/GQA6 queries share each decompressed K/V tile. Cache
+             // Eight D256/GQA6 queries share each decompressed K/V tile. Cache
              // only one query plane so the three output planes retain the same
              // bounded RDNA3 private footprint as the former four-query route.
+             // Dense row packing fills all 48 matrix rows with eight queries.
              {"KVAR_COOPMAT_MATRIX_BATCHES", "3"},
              {"KVAR_COOPMAT_QUERY_CACHE_BATCHES", "1"},
+             {"KVAR_COOPMAT_DENSE_GQA_ROWS", "1"},
              {"KVAR_COOPMAT_MAX_HEAD_DIM", "256"},
              {"KVAR_COOPMAT_MAX_HEAD_SLICES", "2"}},
             true, true);

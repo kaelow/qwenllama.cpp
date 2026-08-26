@@ -23,6 +23,9 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 #ifndef KVAR_COOPMAT_QUERY_CACHE_BATCHES
 #define KVAR_COOPMAT_QUERY_CACHE_BATCHES KVAR_COOPMAT_MATRIX_BATCHES
 #endif
+#ifndef KVAR_COOPMAT_DENSE_GQA_ROWS
+#define KVAR_COOPMAT_DENSE_GQA_ROWS 0
+#endif
 #ifndef KVAR_COOPMAT_MAX_HEAD_DIM
 #define KVAR_COOPMAT_MAX_HEAD_DIM 512
 #endif
@@ -613,15 +616,26 @@ void main() {
     const uint query_head_first = logical_head * gqa();
 #ifdef KVAR_COOPMAT_PREFILL
     const uint queries_per_matrix = max(1u, 16u / gqa());
-    const uint first_queries = min(queries_here, queries_per_matrix);
-    const uint second_queries = min(
-        queries_here - first_queries, queries_per_matrix);
-    const uint third_queries = queries_here - first_queries - second_queries;
-    const uint active_rows = first_queries * gqa();
-    const uint second_active_rows = second_queries * gqa();
-    const uint third_active_rows = third_queries * gqa();
+#if KVAR_COOPMAT_DENSE_GQA_ROWS
+    // GQA6 leaves four rows idle when each 16-row matrix must start at a
+    // query boundary. Let a query span adjacent matrices instead: three
+    // matrices then cover 48 useful query-head rows, or eight queries, with
+    // exactly the same accumulator and LDS allocation as the former
+    // boundary-aligned six-query route.
+    const uint rows_per_matrix_batch = 16u;
+#else
+    const uint rows_per_matrix_batch = queries_per_matrix * gqa();
+#endif
+    const uint packed_query_rows = queries_here * gqa();
+    const uint active_rows = min(packed_query_rows, rows_per_matrix_batch);
+    const uint second_active_rows = min(
+        packed_query_rows - active_rows, rows_per_matrix_batch);
+    const uint third_active_rows = min(
+        packed_query_rows - active_rows - second_active_rows,
+        rows_per_matrix_batch);
     const uint matrix_batches = min(COOPMAT_MATRIX_BATCHES,
-        third_queries > 0u ? 3u : (second_queries > 0u ? 2u : 1u));
+        (packed_query_rows + rows_per_matrix_batch - 1u) /
+            rows_per_matrix_batch);
 #else
     const uint active_rows = queries_here * gqa();
 #endif
@@ -714,8 +728,8 @@ void main() {
     // partial numerator in registers and merge tile-local softmax statistics
     // online, avoiding one global workspace plane and reducer input per tile.
     // Cache a configurable prefix of the query matrices for the complete
-    // record loop. D256/GQA6 keeps one of three matrices cached: together with
-    // the other two are reread from the small, hot query tensor. This lets six
+    // record loop. D256/GQA6 keeps one of three matrices cached; the other two
+    // are reread from the small, hot query tensor. Dense row packing lets eight
     // queries share each expensive KVarN K/V reconstruction.
     float16_t query_cache[KVAR_COOPMAT_QUERY_CACHE_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
     float accumulator[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
@@ -731,14 +745,15 @@ void main() {
             matrix_batch < cached_matrix_batches; ++matrix_batch) {
         const uint batch_active_rows = matrix_batch == 0u ? active_rows :
             (matrix_batch == 1u ? second_active_rows : third_active_rows);
-        const uint batch_query_base = matrix_batch * queries_per_matrix;
+        const uint batch_row_base = matrix_batch * rows_per_matrix_batch;
         for (uint dim_base = 0u;
                 dim_base < head_dim; dim_base += 16u) {
             float q_value = 0.0;
             if (cached_q_row < batch_active_rows) {
+                const uint packed_row = batch_row_base + cached_q_row;
                 const uint row_query = query_base() + local_query_base +
-                    batch_query_base + cached_q_row / gqa();
-                const uint query_head = query_head_first + cached_q_row % gqa();
+                    packed_row / gqa();
+                const uint query_head = query_head_first + packed_row % gqa();
                 const uint q_base = row_query * q_nb1() + query_head * q_nb2() +
                     out_stream * head_dim * n_query() * n_query_heads;
                 q_value = uintBitsToFloat(
@@ -775,7 +790,7 @@ void main() {
 
     // A compact prefill descriptor contains the union of the persistent tail
     // and every row produced by the current ubatch. For PP512/tail128 that is
-    // commonly 640 candidates, while a packed group of six adjacent queries
+    // commonly 640 candidates, while a packed group of eight adjacent queries
     // can see only about 133 of them. Reject wholly masked chunks before any
     // K/V loads or cooperative-matrix work. The decision is workgroup-uniform,
     // so skipped chunks simply leave the online softmax state unchanged.
@@ -884,10 +899,11 @@ void main() {
                 const uint batch_active_rows = matrix_batch == 0u ? active_rows :
                     (matrix_batch == 1u ? second_active_rows : third_active_rows);
                 if (q_row < batch_active_rows) {
-                    const uint batch_query_base = matrix_batch * queries_per_matrix;
+                    const uint packed_row =
+                        matrix_batch * rows_per_matrix_batch + q_row;
                     const uint row_query = query_base() + local_query_base +
-                        batch_query_base + q_row / gqa();
-                    const uint query_head = query_head_first + q_row % gqa();
+                        packed_row / gqa();
+                    const uint query_head = query_head_first + packed_row % gqa();
                     const uint q_base = row_query * q_nb1() + query_head * q_nb2() +
                         out_stream * head_dim * n_query() * n_query_heads;
                     q_value = float16_t(uintBitsToFloat(
@@ -1028,12 +1044,12 @@ void main() {
         barrier();
         const uint batch_active_rows = matrix_batch == 0u ? active_rows :
             (matrix_batch == 1u ? second_active_rows : third_active_rows);
-        const uint batch_query_base = matrix_batch * queries_per_matrix;
+        const uint batch_row_base = matrix_batch * rows_per_matrix_batch;
         const uint stats_base = matrix_batch * 16u;
         const uint probability_base = matrix_batch * 64u * 16u;
 #else
     const uint batch_active_rows = active_rows;
-    const uint batch_query_base = 0u;
+    const uint batch_row_base = 0u;
     const uint stats_base = 0u;
     const uint probability_base = 0u;
 #endif
@@ -1043,9 +1059,10 @@ void main() {
         bool enabled = row < batch_active_rows && local_token < tile_tokens;
         float score = -3.402823466e38;
         if (enabled) {
+            const uint packed_row = batch_row_base + row;
             const uint row_query = query_base() + local_query_base +
-                batch_query_base + row / gqa();
-            const uint query_head = query_head_first + row % gqa();
+                packed_row / gqa();
+            const uint query_head = query_head_first + packed_row % gqa();
             const float slope = p.max_bias > 0.0 ?
                 (query_head < n_head_log2 ?
                     pow(m0, float(query_head + 1u)) :
@@ -1165,12 +1182,12 @@ void main() {
                 matrix_batch < matrix_batches; ++matrix_batch) {
             const uint batch_active_rows = matrix_batch == 0u ? active_rows :
                 (matrix_batch == 1u ? second_active_rows : third_active_rows);
-            const uint batch_query_base = matrix_batch * queries_per_matrix;
+            const uint batch_row_base = matrix_batch * rows_per_matrix_batch;
             const uint stats_base = matrix_batch * 16u;
             const uint probability_base = matrix_batch * 64u * 16u;
 #else
         const uint batch_active_rows = active_rows;
-        const uint batch_query_base = 0u;
+        const uint batch_row_base = 0u;
         const uint stats_base = 0u;
         const uint probability_base = 0u;
 #endif
@@ -1203,9 +1220,10 @@ void main() {
                 accumulator[accumulator_index] * sh_cm_old_scale[stats_base + row] +
                 value * sh_cm_tile_scale[stats_base + row];
 #else
+            const uint packed_row = batch_row_base + row;
             const uint row_query_local = local_query_base +
-                batch_query_base + row / gqa();
-            const uint query_head = query_head_first + row % gqa();
+                packed_row / gqa();
+            const uint query_head = query_head_first + packed_row % gqa();
             const uint matrix_base = head_dim * n_query_heads *
                 (split_index + split_k *
                     (row_query_local + tile_queries * out_stream)) +
@@ -1226,14 +1244,15 @@ void main() {
             matrix_batch < matrix_batches; ++matrix_batch) {
         const uint batch_active_rows = matrix_batch == 0u ? active_rows :
             (matrix_batch == 1u ? second_active_rows : third_active_rows);
-        const uint batch_query_base = matrix_batch * queries_per_matrix;
+        const uint batch_row_base = matrix_batch * rows_per_matrix_batch;
         const uint stats_base = matrix_batch * 16u;
         if (lane < batch_active_rows * 16u) {
             const uint row = lane / 16u;
             const uint dim_local = lane & 15u;
+            const uint packed_row = batch_row_base + row;
             const uint row_query_local = local_query_base +
-                batch_query_base + row / gqa();
-            const uint query_head = query_head_first + row % gqa();
+                packed_row / gqa();
+            const uint query_head = query_head_first + packed_row % gqa();
             const uint matrix_base = head_dim * n_query_heads *
                 (split_index + split_k *
                     (row_query_local + tile_queries * out_stream)) +
@@ -1245,9 +1264,10 @@ void main() {
             }
         }
         if (lane < batch_active_rows) {
+            const uint packed_row = batch_row_base + lane;
             const uint row_query_local = local_query_base +
-                batch_query_base + lane / gqa();
-            const uint query_head = query_head_first + lane % gqa();
+                packed_row / gqa();
+            const uint query_head = query_head_first + packed_row % gqa();
             const uint lm_base = matrix_values + n_query_heads * 2u *
                 (split_index + split_k *
                     (row_query_local + tile_queries * out_stream));
