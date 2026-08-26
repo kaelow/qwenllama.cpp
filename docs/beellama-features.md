@@ -212,6 +212,16 @@ transient bytes and clamps `VK_EXT_memory_budget` availability to the physical
 heap, including the valid high-pressure case where reported usage exceeds the
 current budget.
 
+On discrete GPUs that expose both `VK_EXT_pageable_device_local_memory` and
+`VK_EXT_memory_priority`, Vulkan enables pageable device-local allocations and
+high allocation priority automatically. This lets paging operating systems keep
+model, KV-cache, and active workspace allocations device-local through transient
+heap pressure instead of prematurely selecting host-local memory. Unsupported
+devices retain the existing allocation path. Set
+`GGML_VK_DISABLE_PAGEABLE_DEVICE_LOCAL_MEMORY=1` to opt out for a driver-specific
+regression; `GGML_VK_ENABLE_MEMORY_PRIORITY=1` remains available for devices
+that expose memory priority without pageable device-local memory.
+
 Each selected layer must be owned by a backend that implements KVarN store and
 attention, or an explicitly supported materialization fallback. Unsupported or
 tensor-split placements fail closed; draft and auxiliary contexts use standard

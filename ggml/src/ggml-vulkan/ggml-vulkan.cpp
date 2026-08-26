@@ -792,7 +792,8 @@ struct vk_device_struct {
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
-    bool memory_priority;
+    bool memory_priority {};
+    bool pageable_device_local_memory {};
     vk::Device device;
     uint32_t vendor_id;
     vk::DriverId driver_id;
@@ -6829,6 +6830,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool coopmat2_decode_vector_support = false;
         bool pipeline_executable_properties_support = false;
         bool internally_sync_support = false;
+        bool memory_priority_support = false;
+#if defined(VK_EXT_pageable_device_local_memory)
+        bool pageable_device_local_memory_support = false;
+#endif
         device->coopmat_support = false;
         device->integer_dot_product = false;
         device->shader_64b_indexing = false;
@@ -6891,9 +6896,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 dot2_f16_support = true;
             } else if (strcmp("VK_KHR_pipeline_executable_properties", properties.extensionName) == 0) {
                 pipeline_executable_properties_support = true;
-            } else if (strcmp("VK_EXT_memory_priority", properties.extensionName) == 0 &&
-                       getenv("GGML_VK_ENABLE_MEMORY_PRIORITY")) {
-                device->memory_priority = true;
+            } else if (strcmp(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME, properties.extensionName) == 0) {
+                memory_priority_support = true;
+#if defined(VK_EXT_pageable_device_local_memory)
+            } else if (strcmp(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME, properties.extensionName) == 0) {
+                pageable_device_local_memory_support = true;
+#endif
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -7017,6 +7025,25 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+
+        // Pageable device-local memory is useful on discrete GPUs managed by a
+        // paging OS (notably WDDM): allocations can remain device-local even
+        // when the current heap budget is under pressure, while memory priority
+        // tells the driver to retain active model/cache allocations first. The
+        // extension depends on VK_EXT_memory_priority. Keep the older explicit
+        // memory-priority opt-in for implementations that expose only that
+        // extension, and provide an opt-out for driver-specific regressions.
+        const bool request_pageable_device_local_memory =
+#if defined(VK_EXT_pageable_device_local_memory)
+            !device->uma && memory_priority_support && pageable_device_local_memory_support &&
+            getenv("GGML_VK_DISABLE_PAGEABLE_DEVICE_LOCAL_MEMORY") == nullptr;
+#else
+            false;
+#endif
+        const bool request_memory_priority_explicit =
+            getenv("GGML_VK_ENABLE_MEMORY_PRIORITY") != nullptr;
+        const bool request_memory_priority = memory_priority_support &&
+            (request_pageable_device_local_memory || request_memory_priority_explicit);
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
@@ -7133,15 +7160,24 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_EXT_pipeline_robustness");
         }
 
-        VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features;
-        memory_priority_features.pNext = nullptr;
+        VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features {};
         memory_priority_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
-        memory_priority_features.memoryPriority = VK_FALSE;
-        if (device->memory_priority) {
+        if (request_memory_priority) {
             last_struct->pNext = (VkBaseOutStructure *)&memory_priority_features;
             last_struct = (VkBaseOutStructure *)&memory_priority_features;
-            device_extensions.push_back("VK_EXT_memory_priority");
+            device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
         }
+
+#if defined(VK_EXT_pageable_device_local_memory)
+        VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_device_local_memory_features {};
+        pageable_device_local_memory_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT;
+        if (request_pageable_device_local_memory) {
+            last_struct->pNext = (VkBaseOutStructure *)&pageable_device_local_memory_features;
+            last_struct = (VkBaseOutStructure *)&pageable_device_local_memory_features;
+            device_extensions.push_back(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+        }
+#endif
 
         VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_control_features;
         subgroup_size_control_features.pNext = nullptr;
@@ -7268,7 +7304,29 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
 
+#if defined(VK_EXT_pageable_device_local_memory)
+        device->pageable_device_local_memory = request_pageable_device_local_memory &&
+            pageable_device_local_memory_features.pageableDeviceLocalMemory &&
+            memory_priority_features.memoryPriority;
+#else
+        device->pageable_device_local_memory = false;
+#endif
+        device->memory_priority = memory_priority_features.memoryPriority &&
+            (request_memory_priority_explicit || device->pageable_device_local_memory);
+
+        // The queried structs are reused for device creation. Do not enable a
+        // feature merely because its extension name was advertised.
+        memory_priority_features.memoryPriority = device->memory_priority;
+#if defined(VK_EXT_pageable_device_local_memory)
+        pageable_device_local_memory_features.pageableDeviceLocalMemory =
+            device->pageable_device_local_memory;
+#endif
         device->device_fault = device->device_fault && fault_features.deviceFault;
+
+        if (device->pageable_device_local_memory) {
+            GGML_LOG_DEBUG("ggml_vulkan: %s: pageable device-local memory enabled (priority: %d)\n",
+                           device->properties.deviceName.data(), device->memory_priority);
+        }
 
         device->has_internally_synchronized_queues = internally_synchronized_queues_features.internallySynchronizedQueues;
 
