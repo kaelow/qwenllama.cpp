@@ -12051,13 +12051,10 @@ static uint32_t ggml_vk_kvarn_coop_query_pack(
 
     const uint32_t queries_per_matrix = std::max(1u, 16u / gqa);
     if (q->ne[1] > 8 && q->ne[0] == 256 && gqa == 6) {
-        // Qwen D256/GQA6 can fit two queries in each cooperative matrix.  The
-        // former six-query specialization kept three query/accumulator planes
-        // live for the complete KVarN record scan.  On RDNA3 that private state
-        // spills at long context and makes every prefill microbatch progressively
-        // memory-bound.  Two matrix batches retain K/V reuse across four queries
-        // while keeping the shader's register footprint bounded.
-        return 2u * queries_per_matrix;
+        // The D256 specialization caches one of its three query matrices. Six
+        // Qwen queries then reuse each reconstructed K/V tile, avoiding the
+        // 50% increase in body scans of the four-query route.
+        return 3u * queries_per_matrix;
     }
 
     return queries_per_matrix;

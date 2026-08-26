@@ -20,6 +20,9 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 #ifndef KVAR_COOPMAT_MATRIX_BATCHES
 #define KVAR_COOPMAT_MATRIX_BATCHES 2
 #endif
+#ifndef KVAR_COOPMAT_QUERY_CACHE_BATCHES
+#define KVAR_COOPMAT_QUERY_CACHE_BATCHES KVAR_COOPMAT_MATRIX_BATCHES
+#endif
 #ifndef KVAR_COOPMAT_MAX_HEAD_DIM
 #define KVAR_COOPMAT_MAX_HEAD_DIM 512
 #endif
@@ -141,6 +144,7 @@ const uint FLAG_TAIL_HISTORY_SHIFT = 10u;
 const uint GQA_GROUP_MAX = uint(KVAR_GQA_GROUP_MAX);
 const uint COOPMAT_DIM_BLOCKS = uint(KVAR_COOPMAT_DIM_BLOCKS);
 const uint COOPMAT_MATRIX_BATCHES = uint(KVAR_COOPMAT_MATRIX_BATCHES);
+const uint COOPMAT_QUERY_CACHE_BATCHES = uint(KVAR_COOPMAT_QUERY_CACHE_BATCHES);
 const uint COOPMAT_MAX_HEAD_DIM = uint(KVAR_COOPMAT_MAX_HEAD_DIM);
 const uint COOPMAT_MAX_HEAD_SLICES = uint(KVAR_COOPMAT_MAX_HEAD_SLICES);
 
@@ -709,24 +713,27 @@ void main() {
     // A prefill workgroup can own several 64-token record tiles. Keep its
     // partial numerator in registers and merge tile-local softmax statistics
     // online, avoiding one global workspace plane and reducer input per tile.
-    // Cache this invocation's query element for every 16-wide dimension slice.
-    // Reusing it across all body tiles avoids rereading the query tensor once
-    // per record, which matters increasingly as the populated context grows.
-    // Keep KVAR_COOPMAT_MATRIX_BATCHES small: these are private arrays held for
-    // the entire record loop, so increasing the batch count can turn both into
-    // scratch traffic and make prefill cost scale pathologically with context.
-    float16_t query_cache[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
+    // Cache a configurable prefix of the query matrices for the complete
+    // record loop. D256/GQA6 keeps one of three matrices cached: together with
+    // the other two are reread from the small, hot query tensor. This lets six
+    // queries share each expensive KVarN K/V reconstruction.
+    float16_t query_cache[KVAR_COOPMAT_QUERY_CACHE_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
     float accumulator[KVAR_COOPMAT_MATRIX_BATCHES * KVAR_COOPMAT_DIM_BLOCKS];
-    for (uint i = 0u; i < COOPMAT_MATRIX_BATCHES * COOPMAT_DIM_BLOCKS; ++i) {
+    for (uint i = 0u;
+            i < COOPMAT_MATRIX_BATCHES * COOPMAT_DIM_BLOCKS; ++i) {
         accumulator[i] = 0.0;
     }
     const uint cached_q_row = lane >> 4u;
     const uint cached_q_dim_local = lane & 15u;
-    for (uint matrix_batch = 0u; matrix_batch < matrix_batches; ++matrix_batch) {
+    const uint cached_matrix_batches = min(
+        matrix_batches, COOPMAT_QUERY_CACHE_BATCHES);
+    for (uint matrix_batch = 0u;
+            matrix_batch < cached_matrix_batches; ++matrix_batch) {
         const uint batch_active_rows = matrix_batch == 0u ? active_rows :
             (matrix_batch == 1u ? second_active_rows : third_active_rows);
         const uint batch_query_base = matrix_batch * queries_per_matrix;
-        for (uint dim_base = 0u; dim_base < head_dim; dim_base += 16u) {
+        for (uint dim_base = 0u;
+                dim_base < head_dim; dim_base += 16u) {
             float q_value = 0.0;
             if (cached_q_row < batch_active_rows) {
                 const uint row_query = query_base() + local_query_base +
@@ -859,25 +866,37 @@ void main() {
             gl_MatrixUseAccumulator>(0.0);
 #endif
 #endif
-    for (uint dim_base = 0u; dim_base < head_dim; dim_base += 16u) {
+    for (uint dim_base = 0u;
+            dim_base < head_dim; dim_base += 16u) {
         // Applying the scale before FP16 conversion matches the established
         // Vulkan cooperative-matrix FA path. Each invocation owns one element
         // of this 16x16 query slice.
         const uint q_row = lane >> 4u;
         const uint q_dim_local = lane & 15u;
 #ifdef KVAR_COOPMAT_PREFILL
-        sh_cm_q_or_p[q_row * 16u + q_dim_local] =
-            query_cache[dim_base / 16u];
-        if (matrix_batches > 1u) {
-            sh_cm_q_or_p[64u * 16u + q_row * 16u + q_dim_local] =
-                query_cache[COOPMAT_DIM_BLOCKS + dim_base / 16u];
+        for (uint matrix_batch = 0u;
+                matrix_batch < matrix_batches; ++matrix_batch) {
+            float16_t q_value = float16_t(0.0);
+            if (matrix_batch < cached_matrix_batches) {
+                q_value = query_cache[
+                    matrix_batch * COOPMAT_DIM_BLOCKS + dim_base / 16u];
+            } else {
+                const uint batch_active_rows = matrix_batch == 0u ? active_rows :
+                    (matrix_batch == 1u ? second_active_rows : third_active_rows);
+                if (q_row < batch_active_rows) {
+                    const uint batch_query_base = matrix_batch * queries_per_matrix;
+                    const uint row_query = query_base() + local_query_base +
+                        batch_query_base + q_row / gqa();
+                    const uint query_head = query_head_first + q_row % gqa();
+                    const uint q_base = row_query * q_nb1() + query_head * q_nb2() +
+                        out_stream * head_dim * n_query() * n_query_heads;
+                    q_value = float16_t(uintBitsToFloat(
+                        data_q[q_base + dim_base + q_dim_local]) * p.scale);
+                }
+            }
+            sh_cm_q_or_p[
+                matrix_batch * 64u * 16u + q_row * 16u + q_dim_local] = q_value;
         }
-#if KVAR_COOPMAT_MATRIX_BATCHES > 2
-        if (matrix_batches > 2u) {
-            sh_cm_q_or_p[2u * 64u * 16u + q_row * 16u + q_dim_local] =
-                query_cache[2u * COOPMAT_DIM_BLOCKS + dim_base / 16u];
-        }
-#endif
 #else
         float q_value = 0.0;
         if (q_row < active_rows) {
@@ -989,7 +1008,8 @@ void main() {
     const float m0 = exp2(-p.max_bias / float(n_head_log2));
     const float m1 = exp2(-(p.max_bias / 2.0) / float(n_head_log2));
 #ifdef KVAR_COOPMAT_PREFILL
-    for (uint matrix_batch = 0u; matrix_batch < matrix_batches; ++matrix_batch) {
+    for (uint matrix_batch = 0u;
+            matrix_batch < matrix_batches; ++matrix_batch) {
         if (matrix_batch == 0u) {
             coopMatStore(score_mat, sh_cm_score_or_pv,
                 wave * 16u * 16u, 16u,
@@ -1087,7 +1107,8 @@ void main() {
     }
 #endif
 
-    for (uint dim_base = 0u; dim_base < head_dim; dim_base += 16u) {
+    for (uint dim_base = 0u;
+            dim_base < head_dim; dim_base += 16u) {
         if (fast_record) {
             // V is token-major, so four adjacent output dimensions share one
             // packed word pair and token scale/zero pair.
@@ -1140,7 +1161,8 @@ void main() {
         coopMatLoad(v_mat, sh_cm_tile, wave * 16u * 16u, 16u,
             gl_CooperativeMatrixLayoutRowMajor);
 #ifdef KVAR_COOPMAT_PREFILL
-        for (uint matrix_batch = 0u; matrix_batch < matrix_batches; ++matrix_batch) {
+        for (uint matrix_batch = 0u;
+                matrix_batch < matrix_batches; ++matrix_batch) {
             const uint batch_active_rows = matrix_batch == 0u ? active_rows :
                 (matrix_batch == 1u ? second_active_rows : third_active_rows);
             const uint batch_query_base = matrix_batch * queries_per_matrix;
@@ -1200,7 +1222,8 @@ void main() {
     }
 
 #ifdef KVAR_COOPMAT_PREFILL
-    for (uint matrix_batch = 0u; matrix_batch < matrix_batches; ++matrix_batch) {
+    for (uint matrix_batch = 0u;
+            matrix_batch < matrix_batches; ++matrix_batch) {
         const uint batch_active_rows = matrix_batch == 0u ? active_rows :
             (matrix_batch == 1u ? second_active_rows : third_active_rows);
         const uint batch_query_base = matrix_batch * queries_per_matrix;
@@ -1215,7 +1238,8 @@ void main() {
                 (split_index + split_k *
                     (row_query_local + tile_queries * out_stream)) +
                 head_dim * query_head;
-            for (uint dim_base = 0u; dim_base < head_dim; dim_base += 16u) {
+            for (uint dim_base = 0u;
+                    dim_base < head_dim; dim_base += 16u) {
                 data_dst[matrix_base + dim_base + dim_local] = floatBitsToUint(
                     accumulator[matrix_batch * COOPMAT_DIM_BLOCKS + dim_base / 16u]);
             }

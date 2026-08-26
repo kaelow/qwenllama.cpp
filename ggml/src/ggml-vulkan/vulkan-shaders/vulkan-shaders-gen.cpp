@@ -1082,10 +1082,11 @@ void process_shaders() {
             {{"KVAR_COOPMAT", "1"}, {"KVAR_COOPMAT_PREFILL", "1"},
              {"KVAR_PRECOMPUTED_LIVE", "1"}, {"KVAR_GQA_GROUP_MAX", "16"},
              {"KVAR_HEAD_DIM", "256"}, {"KVAR_COOPMAT_DIM_BLOCKS", "16"},
-             // Keep the private query/accumulator state below RDNA3's long-
-             // context spill threshold.  Host dispatch packs four D256/GQA6
-             // queries into these two cooperative-matrix batches.
-             {"KVAR_COOPMAT_MATRIX_BATCHES", "2"},
+             // Six D256/GQA6 queries share each decompressed K/V tile. Cache
+             // only one query plane so the three output planes retain the same
+             // bounded RDNA3 private footprint as the former four-query route.
+             {"KVAR_COOPMAT_MATRIX_BATCHES", "3"},
+             {"KVAR_COOPMAT_QUERY_CACHE_BATCHES", "1"},
              {"KVAR_COOPMAT_MAX_HEAD_DIM", "256"},
              {"KVAR_COOPMAT_MAX_HEAD_SLICES", "2"}},
             true, true);
