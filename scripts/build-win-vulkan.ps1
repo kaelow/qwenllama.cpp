@@ -2,6 +2,8 @@ param(
     [string]$OutputDir = "release-packages",
     [string]$PackageName = "build-win-vulkan",
     [string]$BuildName = "build-win-vulkan",
+    # Comma- or semicolon-separated CMake targets. A single target remains
+    # compatible with the previous interface.
     [string]$Target = "",
     [int]$Parallel = 16,
     [switch]$Package = $false,
@@ -113,6 +115,11 @@ if ($AllTests) {
 $buildDir = Join-Path $repoRoot $BuildName
 $pkgDir = Join-Path $repoRoot "$OutputDir\$PackageName"
 $binDir = Join-Path $buildDir "bin"
+$targets = @(
+    $Target -split '[,;]' |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ }
+)
 
 $commonFlags = @(
     "-G", "Ninja",
@@ -137,7 +144,7 @@ Write-Host "BeeLlama.cpp Windows Vulkan Build"
 Write-Host "SDK:     $vulkanSdk"
 Write-Host "Build:   $buildDir"
 Write-Host "Package: $(if ($Package) { $pkgDir } else { 'disabled (use -Package to enable)' })"
-Write-Host "Target:  $(if ($Target) { $Target } elseif ($AllTests) { 'every test-* target (static, backend-dl off)' } else { 'all' })"
+Write-Host "Target:  $(if ($targets.Count -gt 0) { $targets -join ', ' } elseif ($AllTests) { 'every test-* target (static, backend-dl off)' } else { 'all' })"
 Write-Host "Jobs:    $Parallel"
 Write-Host "Zip:     disabled"
 Write-Host "========================================"
@@ -163,8 +170,8 @@ if ($ConfigureOnly) {
 }
 
 $buildArgs = @("--build", $buildDir, "--parallel", "$Parallel")
-if ($Target) {
-    $buildArgs += @("--target", $Target)
+if ($targets.Count -gt 0) {
+    $buildArgs += @("--target") + $targets
 } elseif ($AllTests) {
     $ninjaTargets = & $ninjaExe -C $buildDir -t targets all 2>$null
     $testTargets = $ninjaTargets |
