@@ -29,6 +29,6 @@
 			</Dialog.Title>
 		</Dialog.Header>
 
-		<SettingsChat {initialSection} onClose={() => (open = false)} onSectionChange={() => {}} />
+		<SettingsChat {initialSection} onClose={() => handleOpenChange(false)} />
 	</Dialog.Content>
 </Dialog.Root>

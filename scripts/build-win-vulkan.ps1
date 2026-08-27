@@ -135,6 +135,15 @@ $commonFlags = @(
     "-DLLAMA_BUILD_TOOLS=ON"
 )
 
+# Fork build numbers do not map to ggml-org/llama-ui bucket tags.  A server
+# build must therefore embed this checkout's UI instead of falling back to the
+# bucket's "latest" bundle, which can be from a different llama.cpp revision.
+$buildsServer = -not $AllTests -and ($targets.Count -eq 0 -or $targets -contains "llama-server")
+if ($buildsServer) {
+    $commonFlags += "-DLLAMA_BUILD_UI=ON"
+    $commonFlags += "-DLLAMA_USE_PREBUILT_UI=OFF"
+}
+
 if ($AllTests) {
     $commonFlags += "-DBUILD_SHARED_LIBS=OFF"
 }

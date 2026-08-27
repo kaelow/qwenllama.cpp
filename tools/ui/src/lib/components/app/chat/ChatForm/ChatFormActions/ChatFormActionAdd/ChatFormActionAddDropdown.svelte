@@ -1,6 +1,10 @@
 <script lang="ts">
 	import { File, MessageSquare, Plus } from '@lucide/svelte';
-	import { ChatFormActionAddToolsSubmenu, McpLogo } from '$lib/components/app';
+	import {
+		ChatFormActionAddMcpSubmenu,
+		ChatFormActionAddReasoningSubmenu,
+		ChatFormActionAddToolsSubmenu
+	} from '$lib/components/app';
 	import { buttonVariants } from '$lib/components/ui/button';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import * as Tooltip from '$lib/components/ui/tooltip';
@@ -84,6 +88,10 @@
 				}
 			}}
 		>
+			<ChatFormActionAddReasoningSubmenu />
+
+			<DropdownMenu.Separator />
+
 			<DropdownMenu.Sub>
 				<DropdownMenu.SubTrigger class="flex cursor-pointer items-center gap-2">
 					<File class={ICON_CLASS_DEFAULT} />
@@ -143,14 +151,7 @@
 
 			<ChatFormActionAddToolsSubmenu />
 
-			<DropdownMenu.Item
-				class="flex cursor-pointer items-center gap-2"
-				onclick={chatFormActions.onMcpSettingsClick}
-			>
-				<McpLogo class={ICON_CLASS_DEFAULT} />
-
-				<span>MCP Servers</span>
-			</DropdownMenu.Item>
+			<ChatFormActionAddMcpSubmenu />
 		</DropdownMenu.Content>
 	</DropdownMenu.Root>
 </div>

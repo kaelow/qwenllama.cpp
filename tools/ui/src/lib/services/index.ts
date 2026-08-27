@@ -294,8 +294,8 @@ export { SandboxService } from './sandbox.service';
  * **RouterService** — Dynamic route URL construction utility
  *
  * Stateless utility for building dynamic route URLs from ROUTES base paths.
- * Static routes (START, MCP_SERVERS) live in ROUTES constants;
- * dynamic routes (CHAT, SETTINGS) are constructed here by appending parameters.
+ * Static routes (START, SEARCH) live in ROUTES constants;
+ * dynamic chat routes are constructed here by appending parameters.
  *
  * **Architecture & Relationships:**
  * - **RouterService** (this class): Stateless URL construction
