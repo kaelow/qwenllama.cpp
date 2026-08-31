@@ -66,6 +66,13 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    llama_kv_memory_stats kv_memory_stats() const override;
+    ggml_type get_kv_tail_type() const override;
+    uint32_t get_kv_tail_group_count() const override;
+    bool get_kv_tail_coverage(uint32_t group_index, llama_seq_id seq_id,
+            llama_kv_tail_coverage_info & out) const override;
+    void reset_kv_tail_planner_timing() override;
+    uint64_t get_kv_tail_planner_timing_ns() const override;
 
     // state write/load
 
@@ -124,6 +131,8 @@ public:
 
     bool next()  override;
     bool apply() override;
+    void graph_compute_start() override;
+    void graph_compute_finish(ggml_status status) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

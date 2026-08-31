@@ -45,13 +45,77 @@ static inline int32_t server_prompt_reuse_alignment(int32_t kvarn_group) {
     return kvarn_group > 0 ? kvarn_group : 1;
 }
 
+static inline bool server_prompt_checkpoint_position_is_stable(
+        llama_pos checkpoint_pos_max,
+        int32_t alignment) {
+    GGML_ASSERT(alignment > 0);
+    const int64_t checkpoint_p0 = int64_t(checkpoint_pos_max) + 1;
+    return checkpoint_p0 > 0 && checkpoint_p0%alignment == 0;
+}
+
 static inline int64_t server_prompt_checkpoint_boundary(
-        int64_t n_prompt_tokens,
+        const server_tokens & prompt,
         int64_t n_tokens_remaining,
         int32_t alignment) {
     GGML_ASSERT(alignment > 0);
-    const int64_t boundary = n_prompt_tokens - n_tokens_remaining;
-    return boundary > 0 ? boundary - boundary % alignment : 0;
+
+    int64_t target_tokens = std::max<int64_t>(
+            0, int64_t(prompt.size()) - n_tokens_remaining);
+    if (alignment == 1) {
+        return target_tokens;
+    }
+    target_tokens = int64_t(prompt.complete_prefix_size_at_or_before(
+            size_t(target_tokens)));
+    llama_pos target_p0 = prompt.pos_next(target_tokens);
+
+    // Logical token counts are not model positions for M-RoPE/media prompts.
+    // Walk physical descriptor boundaries and map the selected one back to a
+    // complete token/media prefix. Usually this loop executes once; another
+    // iteration is needed only when an aligned position falls inside a media
+    // chunk and therefore is not a restorable prefix boundary.
+    while (target_p0 > 0) {
+        const llama_pos aligned_p0 = target_p0 - target_p0%alignment;
+        if (aligned_p0 <= 0) {
+            return 0;
+        }
+
+        const size_t boundary = prompt.prefix_size_at_or_before_pos(aligned_p0);
+        if (boundary == 0) {
+            return 0;
+        }
+
+        const llama_pos boundary_p0 = prompt.pos_next(boundary);
+        if (boundary_p0 == aligned_p0) {
+            return int64_t(boundary);
+        }
+
+        GGML_ASSERT(boundary_p0 < aligned_p0);
+        target_p0 = boundary_p0;
+    }
+
+    return 0;
+}
+
+static inline int32_t server_prompt_checkpoint_draft_cap(
+        llama_pos next_pos,
+        int32_t alignment,
+        int32_t n_draft_max,
+        bool checkpoint_due) {
+    GGML_ASSERT(alignment > 0);
+    if (!checkpoint_due || alignment == 1 || n_draft_max <= 0 || next_pos < 0) {
+        return n_draft_max;
+    }
+
+    const llama_pos offset = next_pos%alignment;
+    if (offset == 0) {
+        return n_draft_max;
+    }
+
+    // The pending sampled token consumes one position. Limit only the draft
+    // suffix so a fully accepted proposal lands on, and never skips over, the
+    // next durable descriptor boundary.
+    const llama_pos distance = alignment - offset;
+    return std::min<int32_t>(n_draft_max, std::max<llama_pos>(0, distance - 1));
 }
 
 enum server_task_type {
@@ -679,7 +743,7 @@ static inline server_prompt_reuse_plan server_prompt_plan_reuse(
     for (const auto & checkpoint : prompt.checkpoints) {
         if (checkpoint.n_tokens > 0 &&
                 checkpoint.n_tokens <= int64_t(result.lexical_tokens) &&
-                checkpoint.n_tokens%alignment == 0 &&
+                server_prompt_checkpoint_position_is_stable(checkpoint.pos_max, alignment) &&
                 checkpoint.pos_max <= requested_p0 &&
                 (checkpoint.pos_min == 0 ||
                  checkpoint.pos_min < checkpoint_pos_min_threshold) &&
@@ -723,6 +787,26 @@ struct server_prompt_restore_transaction_io {
     std::function<void(server_prompt_state_kind)> commit;
 };
 
+enum server_prompt_restore_reason {
+    SERVER_PROMPT_RESTORE_NONE,
+    SERVER_PROMPT_RESTORE_INVALID_IO,
+    SERVER_PROMPT_RESTORE_MISSING_REQUIRED_STATE,
+    SERVER_PROMPT_RESTORE_PREPARE_REJECTED,
+};
+
+struct server_prompt_restore_result {
+    bool success = false;
+    bool has_component = false;
+    server_prompt_state_kind component = SERVER_PROMPT_STATE_MAIN;
+    server_prompt_restore_reason reason = SERVER_PROMPT_RESTORE_NONE;
+};
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
+        server_prompt_state_view target,
+        server_prompt_state_view draft,
+        server_prompt_state_view speculative,
+        const server_prompt_restore_transaction_io & io);
+
 bool server_prompt_restore_transaction(
         server_prompt_state_view target,
         server_prompt_state_view draft,
@@ -740,7 +824,22 @@ bool server_prompt_restore_transaction(
         server_prompt_state_view speculative_state,
         bool restore_target,
         bool restore_draft,
-        bool restore_speculative);
+        bool restore_speculative,
+        bool speculative_state_durable);
+
+server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
+        llama_context * target,
+        llama_context * draft,
+        common_speculative * speculative,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags,
+        server_prompt_state_view target_state,
+        server_prompt_state_view draft_state,
+        server_prompt_state_view speculative_state,
+        bool restore_target,
+        bool restore_draft,
+        bool restore_speculative,
+        bool speculative_state_durable);
 
 struct server_prompt_data {
     std::vector<uint8_t> main;

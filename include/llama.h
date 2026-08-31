@@ -254,6 +254,12 @@ extern "C" {
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
+    enum llama_lazy_mode {
+        LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
+        LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -302,6 +308,12 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // Optional hidden-state rows consumed by auxiliary decoder graphs
+        // (currently Qwen MTP). Unlike embd, this never replaces token input:
+        // token/embd selects the token representation and embd_nextn supplies
+        // the independently produced target hidden state for the same row.
+        float        *  embd_nextn;
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -354,6 +366,8 @@ extern "C" {
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
+
+        enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -529,6 +543,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
@@ -1170,7 +1185,9 @@ extern "C" {
     // The batch has to be freed with llama_batch_free()
     // If embd != 0, llama_batch.embd will be allocated with size of n_tokens * embd * sizeof(float)
     // Otherwise, llama_batch.token will be allocated to store n_tokens llama_token
-    // The rest of the llama_batch members are allocated with size n_tokens
+    // The rest of the llama_batch members are allocated with size n_tokens.
+    // embd_nextn is left NULL and, when supplied by the caller, is released by
+    // llama_batch_free() together with the other allocated members.
     // All members are left uninitialized
     LLAMA_API struct llama_batch llama_batch_init(
             int32_t n_tokens,

@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
+#include <string>
 
 //
 // llama_kv_cache_dsa_iswa
@@ -96,9 +98,11 @@ bool llama_kv_cache_dsa_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     if (!can_seq_rm(seq_id, p0, p1)) {
         return false;
     }
+
     if (!kv_dsa->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+
     return kv_swa->seq_rm(seq_id, p0, p1);
 }
 
@@ -106,6 +110,7 @@ bool llama_kv_cache_dsa_iswa::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx
     if (!kv_dsa->seq_rm_cell(seq_id, cell_idx)) {
         return false;
     }
+
     return kv_swa->seq_rm_cell(seq_id, cell_idx);
 }
 
@@ -149,6 +154,54 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsa_iswa::memory_bre
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+llama_kv_memory_stats llama_kv_cache_dsa_iswa::kv_memory_stats() const {
+    llama_kv_memory_stats result = kv_dsa->kv_memory_stats();
+    result.add(kv_swa->kv_memory_stats());
+    return result;
+}
+
+ggml_type llama_kv_cache_dsa_iswa::get_kv_tail_type() const {
+    const ggml_type dsa = kv_dsa->get_kv_tail_type();
+    const ggml_type swa = kv_swa->get_kv_tail_type();
+    if (dsa == GGML_TYPE_COUNT) {
+        return swa;
+    }
+    if (swa == GGML_TYPE_COUNT) {
+        return dsa;
+    }
+    if (dsa != swa) {
+        throw std::runtime_error(format(
+                "KV tail groups resolved to incompatible storage types %s and %s",
+                ggml_type_name(dsa), ggml_type_name(swa)));
+    }
+    return dsa;
+}
+
+uint32_t llama_kv_cache_dsa_iswa::get_kv_tail_group_count() const {
+    return kv_dsa->get_kv_tail_group_count() + kv_swa->get_kv_tail_group_count();
+}
+
+bool llama_kv_cache_dsa_iswa::get_kv_tail_coverage(
+        uint32_t group_index, llama_seq_id seq_id, llama_kv_tail_coverage_info & out) const {
+    const uint32_t n_dsa = kv_dsa->get_kv_tail_group_count();
+    return group_index < n_dsa ? kv_dsa->get_kv_tail_coverage(group_index, seq_id, out) :
+            kv_swa->get_kv_tail_coverage(group_index - n_dsa, seq_id, out);
+}
+
+void llama_kv_cache_dsa_iswa::reset_kv_tail_planner_timing() {
+    kv_dsa->reset_kv_tail_planner_timing();
+    kv_swa->reset_kv_tail_planner_timing();
+}
+
+uint64_t llama_kv_cache_dsa_iswa::get_kv_tail_planner_timing_ns() const {
+    return kv_dsa->get_kv_tail_planner_timing_ns() + kv_swa->get_kv_tail_planner_timing_ns();
+}
+
+bool llama_kv_cache_dsa_iswa::requires_state_for_partial_restore() const {
+    return kv_dsa->requires_state_for_partial_restore() ||
+           kv_swa->requires_state_for_partial_restore();
 }
 
 llama_memory_context_ptr llama_kv_cache_dsa_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -262,11 +315,6 @@ llama_memory_i::seq_rm_capability llama_kv_cache_dsa_iswa::get_seq_rm_capability
     return llama_memory_seq_rm_capability_all({ kv_dsa.get(), kv_swa.get() });
 }
 
-bool llama_kv_cache_dsa_iswa::requires_state_for_partial_restore() const {
-    return kv_dsa->requires_state_for_partial_restore() ||
-           kv_swa->requires_state_for_partial_restore();
-}
-
 bool llama_kv_cache_dsa_iswa::state_seq_can_save(llama_seq_id seq_id) const {
     return kv_dsa->state_seq_can_save(seq_id) &&
            kv_swa->state_seq_can_save(seq_id);
@@ -376,6 +424,16 @@ bool llama_kv_cache_dsa_iswa_context::apply() {
     res = res & ctx_swa->apply();
 
     return res;
+}
+
+void llama_kv_cache_dsa_iswa_context::graph_compute_start() {
+    ctx_dsa->graph_compute_start();
+    ctx_swa->graph_compute_start();
+}
+
+void llama_kv_cache_dsa_iswa_context::graph_compute_finish(ggml_status compute_status) {
+    ctx_dsa->graph_compute_finish(compute_status);
+    ctx_swa->graph_compute_finish(compute_status);
 }
 
 llama_memory_status llama_kv_cache_dsa_iswa_context::get_status() const {

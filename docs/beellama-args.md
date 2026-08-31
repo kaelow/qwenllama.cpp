@@ -16,7 +16,7 @@ buffer-device-address support for its direct route. An explicitly supported
 materialization fallback retains compressed persistent storage when a native
 route is unavailable. Pre-Turing NVIDIA GPUs use CUDA's portable rotated-domain
 body-plus-tail route and require a CUDA 12.4 build or release package. CUDA
-13.1 packages target Turing and newer architectures.
+13.3 packages target Turing and newer architectures.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
@@ -174,6 +174,21 @@ Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
 tail metric is actionable rather than silently counted as a hit. Accounted
 bytes are serialized payload accounting, not exact process-resident memory.
 
+## Optional HIP speculative accelerator
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--spec-draft-accelerator native\|hip` | `LLAMA_ARG_SPEC_DRAFT_ACCELERATOR` | `native` | Selects the ordinary portable draft implementation or the explicitly opted-in backend-owned HIP accelerator. `hip` currently requires a validated Qwen3.8-27B artifact, an accelerator-enabled build, and `gfx1100`. |
+| `--spec-draft-accelerator-model FNAME` | `LLAMA_ARG_SPEC_DRAFT_ACCELERATOR_MODEL` | Unused | Loads the compact, versioned artifact produced by `tools/spec-accel/prepare.py`. Its model fingerprint, shapes, tensor types, vocabulary remap, and M-RoPE metadata must match the target. It does not replace or modify the target GGUF. |
+| `--spec-draft-device DEV` | — | Backend selection | Selects the HIP device. Use `--list-devices` and choose the `gfx1100` ROCm entry; the suffix is the HIP ordinal and may be `ROCm1` when an integrated GPU is `ROCm0`. |
+| `--spec-draft-type-k TYPE`, `--spec-draft-type-v TYPE` | Existing upstream vars | `f16` | For accelerated MTP, selects its private state and currently accepts homogeneous F16/F16 or Q8_0/Q8_0. These options do **not** constrain the target cache. |
+
+The target cache is independent: every target pair accepted by the normal
+engine remains valid, including KVarN2/3/4/5/6/8, q8/q6/q6_1/q5/q5_1 and
+asymmetric standard pairs, with any supported exact-tail size/type. DFlash uses
+an independent F16 2048-token private ring. See
+[ROCm 10 speculative acceleration](spec-accel-rocm.md).
+
 ## DFlash and adaptive draft depth
 
 The first five rows are upstream speculative controls with Bee-specific DFlash
@@ -186,7 +201,7 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-draft-n-max N` | `LLAMA_ARG_SPEC_DRAFT_N_MAX` | Upstream: `3`; omitted DFlash: `dflash.block_size - 1` | Sets the maximum draft depth. An explicit CLI or env value always wins; upstream clamps values above the drafter's trained limit. A block-16 drafter therefore defaults to 15 only when this setting is omitted. |
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
 | `--spec-draft-p-min P`, `--draft-p-min P` | `LLAMA_ARG_SPEC_DRAFT_P_MIN` | `0.0` | Stops an individual greedy draft when its probability falls below `P`; this is independent of the profit controller. |
-| `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | `profit` adapts DFlash depth from measured cycle profit; `off` keeps the resolved or explicit maximum static. Other speculative modes are unchanged. |
+| `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | For DFlash1, `profit` adapts depth from measured cycle profit and `off` keeps the resolved or explicit maximum static. DFlash2 always uses its fixed trained block limit and selector confidence; other speculative modes are unchanged. |
 | `--spec-dm-profit-min F` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN` | `0.05` | Sets the minimum margin over the no-spec baseline before clearing disable dwell. Range: `0.0` to `0.50`. |
 | `--spec-dm-profit-raise-margin F` | `LLAMA_ARG_SPEC_DM_PROFIT_RAISE_MARGIN` | `0.05` | Sets the relative profit margin required to raise draft depth. Range: `0.0` to `1.0`. |
 | `--spec-dm-profit-lower-margin F` | `LLAMA_ARG_SPEC_DM_PROFIT_LOWER_MARGIN` | `0.05` | Sets the relative profit margin required to lower draft depth. Range: `0.0` to `1.0`. |
@@ -251,10 +266,11 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 |---|---|---|---|
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
 | `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
+| `-DGGML_HIP_SPEC_ACCEL=ON/OFF` | — | Off | Compiles the opt-in versioned speculative-accelerator ABI into the dynamic HIP backend. It never changes native speculation unless `--spec-draft-accelerator hip` is passed. The Windows Vulkan+ROCm 10 RDNA3 script enables it. |
 
-Release packages are built with CUDA 12.4 and 13.1. CUDA 12.4 can emit the
+Release packages are built with CUDA 12.4 and 13.3. CUDA 12.4 can emit the
 Maxwell, Pascal, and Volta PTX targets used by the portable KVarN route; CUDA
-13.1 covers Turing and newer architectures. The release workflow no longer has
+13.3 covers Turing and newer architectures. The release workflow no longer has
 an exhaustive per-architecture CUDA compile gate. For a local or CI build,
 select the intended target explicitly with `CMAKE_CUDA_ARCHITECTURES` when the
 build host cannot detect it. Pre-Turing support remains runtime-unqualified

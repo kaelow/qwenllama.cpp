@@ -102,6 +102,27 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// True only for model graphs that implement the prefix K/V-only MTP route and
+// accept token embeddings independently from target hidden-state rows.
+LLAMA_API bool llama_model_supports_mtp_kv_only(const struct llama_model * model);
+
+// Exact dimensions used to validate optional backend-owned speculative
+// runtimes.  Returning false means the model must use the native graph.
+struct llama_spec_accel_model_desc {
+    uint32_t n_embd;
+    uint32_t n_vocab;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t n_layer_nextn;
+    bool is_mrope;
+};
+
+LLAMA_API bool llama_model_get_spec_accel_desc(
+        const struct llama_model * model,
+        struct llama_spec_accel_model_desc * descriptor);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
@@ -112,15 +133,23 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Extract multiple ordered layer inputs as one token-major contiguous tensor.
+// Passing n_lids == 0 disables the bundled output.
+LLAMA_API void llama_set_embeddings_layer_inp_bundle(
+        struct llama_context * ctx, const uint32_t * lids, size_t n_lids);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+LLAMA_API float * llama_get_embeddings_layer_inp_bundle(struct llama_context * ctx);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
 // model/context data extraction
 //
+
+LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
 
 // returns pointer to the target-model layer indices
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);

@@ -189,7 +189,9 @@ int main(int argc, char ** argv) {
                 /* .drafting   = */ true,
                 /* .n_max      = */ n_draft_max,
                 /* .costly_rollback = */ false,
+                /* .native_rollback = */ UINT32_MAX,
                 /* .n_past     = */ n_past,
+                /* .pos_next   = */ n_past,
                 /* .id_last    = */ id_last,
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output

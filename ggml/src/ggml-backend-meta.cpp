@@ -806,7 +806,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
+        if (!split_states_equal(src_ss[0], src_ss[2])) {
+            GGML_ABORT("set_rows split mismatch: src0=%s axis=%d segments=%u nr=%u ne={%lld,%lld}; src2=%s axis=%d segments=%u nr=%u ne={%lld,%lld}",
+                    tensor->src[0]->name, (int) src_ss[0].axis, src_ss[0].n_segments, src_ss[0].nr[0],
+                    (long long) src_ss[0].ne[0], (long long) src_ss[0].ne[1],
+                    tensor->src[2]->name, (int) src_ss[2].axis, src_ss[2].n_segments, src_ss[2].nr[0],
+                    (long long) src_ss[2].ne[0], (long long) src_ss[2].ne[1]);
+        }
         return src_ss[0];
     };
 
@@ -1217,6 +1223,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         buf_ctx.split_state_cache[key].first = calculate_split_state();
         memcpy(buf_ctx.split_state_cache[key].second, tensor, sizeof(buf_ctx.split_state_cache[key].second));
         if (buf_ctx.debug > 0) {
+            auto format_split = [&](const ggml_backend_meta_split_state & split_state) {
+                std::string result;
+                for (size_t s = 0; s < split_state.n_segments; s++) {
+                    if (!result.empty()) {
+                        result += "; ";
+                    }
+                    result += "{";
+                    for (size_t j = 0; j < n_bufs; j++) {
+                        if (j > 0) {
+                            result += ", ";
+                        }
+                        result += std::to_string(split_state.ne[s*n_bufs + j]);
+                    }
+                    result += "}x" + std::to_string(split_state.nr[s]);
+                }
+                return result;
+            };
+
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                 if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
@@ -1230,27 +1254,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true) :
                         ggml_backend_meta_get_split_state(
                                 buf_ctx, stc, tensor->src[i], /*assume_sync =*/ true);
-                GGML_ASSERT(split_state.n_segments == 1);
-                const char * axis_name = ggml_backend_meta_split_axis_name(split_state.axis);
-                std::string ne_info;
-                for (size_t j = 0; j < n_bufs; j++) {
-                    if (!ne_info.empty()) {
-                        ne_info += ", ";
-                    }
-                    ne_info += std::to_string(split_state.ne[j]) + "x" + std::to_string(split_state.nr[0]);
-                }
-                srcs_info += std::string(tensor->src[i]->name) + "[" + ggml_op_name(tensor->src[i]->op) + ", " + axis_name + ", {" + ne_info + "}]";
+                srcs_info += std::string(tensor->src[i]->name) + "[" + ggml_op_name(tensor->src[i]->op) + ", " +
+                        ggml_backend_meta_split_axis_name(split_state.axis) + ", " + format_split(split_state) + "]";
             }
-            std::string ne_info;
-            for (size_t j = 0; j < n_bufs; j++) {
-                if (!ne_info.empty()) {
-                    ne_info += ", ";
-                }
-                const ggml_backend_meta_split_state & ss = buf_ctx.split_state_cache[key].first;
-                ne_info += std::to_string(ss.ne[j]) + "x" + std::to_string(ss.nr[0]);
-            }
-            GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
-                ggml_backend_meta_split_axis_name(buf_ctx.split_state_cache[key].first.axis), ne_info.c_str());
+            const ggml_backend_meta_split_state & split_state = buf_ctx.split_state_cache[key].first;
+            GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, %s]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
+                    ggml_backend_meta_split_axis_name(split_state.axis), format_split(split_state).c_str());
         }
     }
 
@@ -1517,9 +1526,14 @@ static void ggml_backend_meta_buffer_memset_tensor(
             }
         } break;
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
-            GGML_ASSERT(value == 0);
-            [[fallthrough]];
-        }
+            // PARTIAL shards are summed. Put the requested representation on
+            // one shard and zero the rest; duplicating a non-zero byte pattern
+            // would multiply the logical value by the number of devices.
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                ggml_backend_tensor_memset(simple_tensor, j == 0 ? value : 0, offset, size);
+            }
+        } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);

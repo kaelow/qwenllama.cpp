@@ -5,7 +5,7 @@ param(
     # Comma- or semicolon-separated CMake targets. A single target remains
     # compatible with the previous interface.
     [string]$Target = "",
-    [int]$Parallel = 16,
+    [int]$Parallel = 24,
     [switch]$Package = $false,
     [switch]$AllTests = $false,
     [switch]$SkipStage = $false,

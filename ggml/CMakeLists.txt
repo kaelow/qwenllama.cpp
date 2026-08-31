@@ -323,6 +323,7 @@ endfunction()
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
+option(GGML_HIP_SPEC_ACCEL                  "ggml: enable the opt-in HIP speculative accelerator" OFF)
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
@@ -435,6 +436,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cpu.h
     include/ggml-alloc.h
     include/ggml-backend.h
+    include/ggml-spec-accel.h
     include/ggml-blas.h
     include/ggml-cann.h
     include/ggml-cpp.h

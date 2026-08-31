@@ -3,7 +3,7 @@
 BeeLlama v0.4.4 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
-This tree is merged through upstream llama.cpp b10642 (`925e11799`).
+This tree is merged through upstream llama.cpp b10690 (`bdf395515`).
 
 ## KVarN target KV cache
 
@@ -154,13 +154,13 @@ buffer-device-address support. CPU placement is valid with KV offload disabled.
 
 | NVIDIA architecture | Toolkit and package | Native KVarN route | Qualification |
 |---|---|---|---|
-| Turing and newer, SM 7.5+ | CUDA 12.4 or 13.1 | Specialized MMA/split/vector routes with portable fallback | Current release tier; CUDA 13.1 is locally exercised on SM 8.6 |
+| Turing and newer, SM 7.5+ | CUDA 12.4 or 13.3 | Specialized MMA/split/vector routes with portable fallback | Current release tier; CUDA 13.3 requires preview qualification, while its CUDA 13.1 predecessor was locally exercised on SM 8.6 |
 | Volta, SM 7.0/7.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Explicit build target; real-device validation required |
 | Pascal, SM 6.0/6.1/6.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Priority compatibility target for issue #112; real-device validation required |
 | Maxwell, SM 5.0/5.2/5.3 | CUDA 12.4 | Portable direct body-plus-tail attention | Experimental until an SM 5.2 device passes runtime gates |
-| Kepler | Not in the CUDA 12.4/13.1 release lane | None | Unsupported |
+| Kepler | Not in the CUDA 12.4/13.3 release lane | None | Unsupported |
 
-Use the CUDA 12.4 release package for Maxwell, Pascal, or Volta. CUDA 13.1
+Use the CUDA 12.4 release package for Maxwell, Pascal, or Volta. CUDA 13.3
 does not contain device code for those architectures. Build coverage proves
 that a translation unit accepts a target; it does not prove runtime
 correctness, memory behavior, or performance on that GPU.
@@ -546,20 +546,85 @@ persistent VRAM, and both prompt and generation speed as functions of tail
 length. Treat the uniform capped-1024 `auto` setting as a starting policy and
 measure the exact workload before deploying it.
 
+## RDNA gated-delta prefill
+
+ROCm builds use a chunked gated-delta-network prefill implementation on
+RDNA3, RDNA3.5, and RDNA4 when the operation has a scalar gate, one recurrent
+state, and a profitable state-width/token-count combination. The state scan
+keeps 64-token chunks resident in LDS instead of launching the original
+sequential token kernel. State width 128 selects its architecture-specific
+BF16 WMMA route from 32 tokens; FP32 state widths 16 and 32 select chunking from
+256 tokens. Its width-128 FP32 fallback selects chunking from 128 tokens. Width
+64 and smaller final ubatches stay on the measured-faster sequential route.
+WMMA products use BF16 operands, while accumulators and the persistent
+recurrent state remain FP32. Decode, KDA, checkpoint snapshots, CUDA, Vulkan,
+and unsupported GPUs continue to use the existing implementation.
+
+The route follows the graph's actual token count, so it is not tied to a
+particular `-b`, `-ub`, tail length, or target KV-cache type. Set
+`GGML_CUDA_GDN_CHUNKED=0` to restore the original sequential implementation,
+or `GGML_CUDA_GDN_CHUNKED_BF16=0` to retain chunking while selecting its FP32
+kernel. A synchronous launch rejection also falls back to the sequential
+implementation. The incorporated kernels retain their MIT notice in
+[`licenses/llama-cpp-rdna-boosts-MIT.txt`](../licenses/llama-cpp-rdna-boosts-MIT.txt).
+
+## Optional ROCm 10 speculative accelerator
+
+The default `native` path remains the complete portable implementation. Builds
+configured with `GGML_HIP_SPEC_ACCEL=ON` may explicitly select an in-backend
+HIP accelerator for Qwen3.8-27B MTP or DFlash2. It is currently descriptor-
+validated only for `gfx1100` (RX 7900 XTX); unsupported models, artifacts, and
+GPUs fail clearly at startup instead of changing behavior on other systems.
+
+The accelerator has no target-cache format. The target context continues to
+use exactly the K/V pair selected by `--cache-type-k` and `--cache-type-v`,
+including all supported KVarN widths, standard homogeneous or asymmetric
+quantized pairs, and F16/BF16 exact tails. Only the accelerator's private MTP
+draft state is selected by `--spec-draft-type-k/v` and is currently F16/F16 or
+Q8_0/Q8_0. DFlash's private 2048-token ring is F16. Target KVarN records are
+never materialized or reinterpreted by the accelerator.
+
+MTP catch-up performs only the hidden/token projection, K/V projection,
+normalization, four-plane M-RoPE, and private cache stores. It omits Q,
+attention, output projection, FFN, and vocabulary work. Small widths use the
+guarded RDNA3 kernels; larger incoming batches use lazily materialized FP16
+projections and hipBLAS when live VRAM permits. Row tiling follows the actual
+incoming ubatch rather than special-casing `-ub 128`, `256`, or `512`.
+
+DFlash feature extraction is one contiguous target output. Its private cache
+keeps the live 2048-token window plus windows referenced by checkpoints. A
+checkpoint whose old DFlash window is no longer resident temporarily disables
+that draft source until coverage refills; it never forces the target prompt to
+replay from token zero. Reset, suffix removal, fork/copy, position shift,
+multi-slot isolation, transactional checkpoint restore, and durable prompt
+state are implemented by the backend. A runtime fault disables only the
+affected speculative source/sequence, leaving n-gram and normal generation
+available.
+
+Prepare a versioned, target-fingerprinted artifact with
+[`tools/spec-accel/prepare.py`](../tools/spec-accel/prepare.py), then select it
+with `--spec-draft-accelerator hip`, `--spec-draft-accelerator-model`, and the
+`gfx1100` entry printed by `--list-devices`. See the
+[ROCm accelerator guide](spec-accel-rocm.md) for commands and limitations.
+BridgeSpec-derived kernel code retains its MIT attribution in
+[`licenses/BridgeSpec-MIT.txt`](../licenses/BridgeSpec-MIT.txt).
+
 ## Upstream DFlash with profit adaptation
 
 ### What it is
 
 Bee uses upstream `draft-dflash` for drafting and adds a server-side profit
-controller. If the draft maximum is omitted, Bee reads `dflash.block_size` and
-uses one less than the block size, normally 15; the controller remains
-default-on and can select shallower depths at runtime.
+controller for DFlash1. If the draft maximum is omitted, Bee reads
+`dflash.block_size` and uses one less than the block size, normally 15; the
+controller remains default-on and can select shallower DFlash1 depths at
+runtime. DFlash2 uses its fixed trained block limit and selector confidence.
 
 ### When to use it
 
 Use DFlash when you have an upstream-format drafter trained for the exact target
-model. Let the metadata-derived maximum and profit controller establish a
-baseline before pinning a smaller depth.
+model. For DFlash1, let the metadata-derived maximum and profit controller
+establish a baseline before pinning a smaller depth. For DFlash2, tune the
+static maximum and selector confidence against the target workload.
 
 ### Key arguments
 
@@ -580,7 +645,8 @@ cross-build oracle for speculative decoding.
 
 The drafter must expose upstream `dflash` architecture metadata and tensor
 names. Other DFlash GGUF schemas are unsupported. The profit controls apply only
-to DFlash; upstream simple, EAGLE3, MTP, and n-gram modes keep their own defaults.
+to DFlash1; DFlash2, upstream simple, EAGLE3, MTP, and n-gram modes keep their
+own draft-depth behavior.
 
 ## Reasoning loop guard and realtime control
 

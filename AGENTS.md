@@ -9,8 +9,8 @@ architectural reference when rebasing fork features.
 BeeLlama.cpp is Anbeeld's llama.cpp fork. The v0.4.0 fork surface is intentionally
 small:
 
-The current v0.4.4 tree is merged through upstream llama.cpp b10642
-(`925e11799`).
+The current v0.4.4 tree is merged through upstream llama.cpp b10690
+(`bdf395515`).
 
 - Upstream speculative decoding, including `draft-dflash`, `draft-mtp`,
   EAGLE3, and n-gram modes.
@@ -20,7 +20,7 @@ The current v0.4.4 tree is merged through upstream llama.cpp b10642
   `q6_0`, and `q6_1`. Bee's cache-facing `q2_0` uses the internal enum
   `GGML_TYPE_Q2_0S` so it cannot collide with upstream's serialized Q2_0 weight
   format.
-- A profit-only adaptive draft-max controller for DFlash.
+- A profit-only adaptive draft-max controller for DFlash1. DFlash2 keeps its fixed trained block limit and selector confidence.
 - Reasoning-loop detection and the opted-in realtime
   `/v1/chat/completions/control` endpoint.
 - INI presets and KLD measurement support in `llama-perplexity`.
@@ -66,11 +66,11 @@ matrix use descriptor-native MMA fallback.
 Use `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090 and `89` for RTX 4090 when
 the build host cannot detect the target GPU.
 
-On Windows hosts matching CUDA 13.1 and compute capability 8.6, prefer:
+On Windows hosts matching CUDA 13.3 and compute capability 8.6, prefer:
 
 ```powershell
-powershell -File scripts/build-win-cuda-13.1-sm_86.ps1 -AllTests
-powershell -File scripts/build-win-cuda-13.1-sm_86-default.ps1 -AllTests
+powershell -File scripts/build-win-cuda-sm_86.ps1 -AllTests
+powershell -File scripts/build-win-cuda-sm_86-default.ps1 -AllTests
 powershell -File scripts/build-win-vulkan.ps1 -AllTests
 ```
 

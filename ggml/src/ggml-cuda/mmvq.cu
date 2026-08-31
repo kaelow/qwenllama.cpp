@@ -494,7 +494,21 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 1;
             }
         }
-        return 1;
+        // BridgeSpec's gfx1100 sweep identified widths 2..8 as an untuned
+        // one-wave fallthrough. Two waves improve these decode-width GEMVs
+        // without changing the carefully tuned width-1 route above.
+        switch (ncols_dst) {
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
     }
     if (table_id == MMVQ_PARAMETERS_TURING) {
         if (ncols_dst == 1) {
@@ -547,7 +561,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(
+        ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -563,6 +578,25 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             default:
                 return 1;
         }
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
+        if (ncols_dst >= 2 && ncols_dst <= 8) {
+            // Simple dot products can amortize one weight scan over four
+            // rows. Complex lookup-heavy formats stay at two to cap VGPR use.
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_Q6_K:
+                    return 4;
+                default:
+                    return 2;
+            }
+        }
+        return 1;
     }
     return 1;
 }
@@ -586,7 +620,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -865,7 +899,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1406,13 +1440,33 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t s13 = ne12*s12;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
-    const int64_t ncols_dst          = ids ? ne2  : ne1;
-    const int64_t nchannels_y        = ids ? ne11 : ne12;
-    const int64_t nchannels_dst      = ids ? ne1  : ne2;
-    const int64_t stride_col_dst     = ids ? s2   : s1;
-    const int64_t stride_col_y       = ids ? s12  : s11;
-    const int64_t stride_channel_dst = ids ? s1   : s2;
-    const int64_t stride_channel_y   = ids ? s11  : s12;
+    int64_t ncols_dst          = ids ? ne2  : ne1;
+    int64_t nchannels_y        = ids ? ne11 : ne12;
+    int64_t nchannels_dst      = ids ? ne1  : ne2;
+    int64_t stride_col_dst     = ids ? s2   : s1;
+    int64_t stride_col_y       = ids ? s12  : s11;
+    int64_t stride_channel_dst = ids ? s1   : s2;
+    int64_t stride_channel_y   = ids ? s11  : s12;
+
+    // Broadcast-weight channel batches appear as ne1 == 1 with the useful
+    // decode width in ne2. On gfx1100 only, fold widths 2..8 into columns so
+    // one launch reuses the weight scan across those rows. Fusion and every
+    // non-matching layout retain the established path.
+    const bool has_fusion_args = fusion_local.gate != nullptr || fusion_local.x_bias != nullptr ||
+            fusion_local.gate_bias != nullptr || fusion_local.x_scale != nullptr ||
+            fusion_local.gate_scale != nullptr;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (GGML_CUDA_CC_IS_RDNA3_0(cc) && !ids && !has_fusion_args &&
+            ne1 == 1 && ne02 == 1 && ne2 > 1 && ne2 <= MMVQ_MAX_BATCH_SIZE &&
+            ne3 == 1 && ne03 == 1 && ne13 == 1) {
+        ncols_dst          = ne2;
+        stride_col_y       = s12;
+        stride_col_dst     = s2;
+        nchannels_y        = 1;
+        nchannels_dst      = 1;
+        stride_channel_y   = 0;
+        stride_channel_dst = 0;
+    }
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 

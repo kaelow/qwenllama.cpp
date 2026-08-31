@@ -73,6 +73,10 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_SPEC_ACCEL)
+#include "../ggml-hip/spec-accel/spec-accel-runtime.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -4398,7 +4402,9 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
-static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(params);
+
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef USE_CUDA_GRAPH
@@ -5854,6 +5860,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_memory_checkpoint") == 0) {
         return (void *)ggml_backend_cuda_memory_checkpoint;
     }
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_SPEC_ACCEL)
+    if (strcmp(name, "ggml_backend_spec_accel_get_api") == 0) {
+        return (void *)ggml_backend_spec_accel_get_api;
+    }
+#endif
     return nullptr;
 }
 

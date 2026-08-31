@@ -166,16 +166,22 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
-            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
-            for (size_t i = 0; i < n_devs; ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+            if (n_devs == 1) {
+                // A one-device tensor split cannot split anything. Avoid the
+                // Meta wrapper and its graph projection overhead entirely.
+                model->devices.push_back({false, params.devices[0]});
+            } else {
+                LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
+                for (size_t i = 0; i < n_devs; ++i) {
+                    LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+                }
+                model->get_split_state_ud.n_devices = n_devs;
+                model->get_split_state_ud.model = model;
+                model->devices.push_back({
+                    true, ggml_backend_meta_device(
+                    params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                });
             }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
-            model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});
@@ -211,12 +217,18 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
-            gpus.push_back({
-                true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
+            if (devs.size() == 1) {
+                // Same rule for auto-discovered accelerators: a single
+                // device is already the complete execution target.
+                gpus.push_back({false, devs[0]});
+            } else {
+                model->get_split_state_ud.n_devices = devs.size();
+                model->get_split_state_ud.model     = model;
+                gpus.push_back({
+                    true, ggml_backend_meta_device(
+                    devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
+                });
+            }
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -317,6 +329,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+
+        ml.lazy_mode = params.lazy_mode;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));

@@ -16,6 +16,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-release-cache-parent PROPERTY LABELS main)
 
     add_test(
+        NAME test-verify-windows-package
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-verify-windows-package.py)
+    set_property(TEST test-verify-windows-package PROPERTY LABELS main)
+
+    add_test(
         NAME test-backend-ops-seed-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-backend-ops-seed-static.py)
@@ -231,6 +237,7 @@ function(llama_build_and_test source)
     endif()
     target_link_libraries(${TEST_TARGET} PRIVATE llama-common)
 
+
     add_test(
         NAME ${TEST_TARGET}
         WORKING_DIRECTORY ${LLAMA_TEST_WORKING_DIRECTORY}
@@ -273,6 +280,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -367,6 +375,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    # Test state save/load functionality across all architectures, using the generated dummy models
+    llama_test(
+        test-save-load-state
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -432,6 +448,15 @@ endif()
 add_test(NAME test-kvarn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
 set_property(TEST test-kvarn PROPERTY LABELS main)
 
+add_executable(test-spec-accel test-spec-accel.cpp)
+target_compile_features(test-spec-accel PRIVATE cxx_std_17)
+target_link_libraries(test-spec-accel PRIVATE ggml)
+if (LLAMA_TESTS_INSTALL)
+    install(TARGETS test-spec-accel RUNTIME)
+endif()
+add_test(NAME test-spec-accel WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-spec-accel>)
+set_property(TEST test-spec-accel PROPERTY LABELS hip)
+
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
@@ -474,10 +499,6 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 # Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
-
-# Test state save/load functionality
-llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # QuantFactory packages the Apache-2.0 SmolLM2 base model at a pinned revision.
 # Its 64-element attention heads are compatible with standard q4_0 KV tails.

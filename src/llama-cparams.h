@@ -55,6 +55,9 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    // Ordered layer taps concatenated along the hidden dimension into one
+    // contiguous output. Used by DFlash to avoid one transfer per layer.
+    std::vector<uint32_t> embeddings_layer_inp_bundle;
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

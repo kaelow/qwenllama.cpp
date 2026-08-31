@@ -1,4 +1,7 @@
 #include "gated_delta_net.cuh"
+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
+#include "gated_delta_net_chunked.cuh"
+#endif
 #include "ggml-cuda/common.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -285,6 +288,45 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
+
+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
+    // Chunked prefill keeps each recurrent-state slice resident in LDS while
+    // scanning 64-token chunks. It is limited to the RDNA families on which
+    // the kernels were validated; decode, snapshots, KDA, and other devices
+    // retain the existing sequential implementation. Set
+    // GGML_CUDA_GDN_CHUNKED=0 for an exact runtime A/B fallback.
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool chunked_arch = GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+    // gfx1100 measurements put the safe crossover at 32 tokens for the BF16
+    // width-128 route, 128 for its FP32 fallback, and 256 for the FP32
+    // width-16/32 routes. Width 64 remains faster on the sequential
+    // implementation. Use the actual graph size so a small final ubatch does
+    // not pay the two-launch chunking cost.
+    const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
+    const bool want_bf16 = S_v == 128 && (envb == nullptr || strcmp(envb, "0") != 0);
+    const bool chunked_shape = (S_v == 128 && n_tokens >= (want_bf16 ? 32 : 128)) ||
+        ((S_v == 16 || S_v == 32) && n_tokens >= 256);
+    if (chunked_arch && !kda && K == 1 && chunked_shape) {
+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+        if (env == nullptr || strcmp(env, "0") != 0) {
+            float * state_d_ext = cache ? cache->data : nullptr;
+            if (want_bf16) {
+                const bool launched = GGML_CUDA_CC_IS_RDNA4(cc)
+                    ? ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext)
+                    : ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, state_d_ext);
+                if (launched) {
+                    return;
+                }
+                GGML_LOG_WARN("%s: BF16 chunked GDN launch rejected; falling back to the sequential kernel\n", __func__);
+            } else {
+                if (ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext)) {
+                    return;
+                }
+                GGML_LOG_WARN("%s: FP32 chunked GDN launch rejected; falling back to the sequential kernel\n", __func__);
+            }
+        }
+    }
+#endif
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;

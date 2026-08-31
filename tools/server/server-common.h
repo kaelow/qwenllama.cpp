@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "chat.h"
 #include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include "json.h"
 
@@ -183,6 +184,12 @@ public:
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
 
+    // largest complete token/media prefix whose next model position is <= max_pos
+    size_t prefix_size_at_or_before_pos(llama_pos max_pos) const;
+
+    // largest prefix <= n_tokens that does not split a media chunk
+    size_t complete_prefix_size_at_or_before(size_t n_tokens) const;
+
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
     // find next media chunk after idx
@@ -269,7 +276,12 @@ size_t validate_utf8(const std::string& text);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
-server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files, bool is_placeholder = false);
+server_tokens process_mtmd_prompt(
+                                        mtmd_context * mctx,
+                                        const std::string & prompt,
+                                        const std::vector<raw_buffer> & files,
+                                        const mtmd_helper_init_opt & init_opt,
+                                        bool is_placeholder = false);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -289,7 +301,8 @@ std::vector<server_tokens> tokenize_input_prompts(
                                         mtmd_context * mctx,
                                         const json & json_prompt,
                                         bool add_special,
-                                        bool parse_special);
+                                        bool parse_special,
+                                        const mtmd_helper_init_opt & init_opt);
 
 //
 // OAI utils
@@ -561,7 +574,8 @@ server_tokens format_prompt_rerank(
         const struct llama_vocab * vocab,
         mtmd_context * mctx,
         const std::string & query,
-        const std::string & doc);
+        const std::string & doc,
+        const mtmd_helper_init_opt & init_opt);
 
 // simple implementation of a pipe
 // used for streaming data between threads

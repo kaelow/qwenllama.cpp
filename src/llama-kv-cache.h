@@ -45,8 +45,9 @@ public:
         uint32_t s0;
         uint32_t s1;
 
-        std::vector<llama_seq_id> strm; // [ns]
-        std::vector<idx_vec_t>    idxs; // [ns]
+        std::vector<llama_seq_id> strm;        // [ns]
+        std::vector<idx_vec_t>    idxs;        // [ns]
+        std::vector<idx_vec_t>    stage_slots; // [ns], structured caches only
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -77,6 +78,7 @@ public:
 
         void clear() {
             idxs.clear();
+            stage_slots.clear();
         }
 
         // check if indices are contiguous starting from head()
@@ -125,7 +127,9 @@ public:
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   tail_visibility_window = 0);
+                 uint32_t   tail_visibility_window = 0,
+        // a model can hold more than one cache, so tensor names must remain unique
+             const char *   name_tag = "");
 
     ~llama_kv_cache() = default;
 
@@ -206,6 +210,15 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // Restore state while exposing or adopting its physical cell layout. The
+    // Qwen3.8 indexer cache mirrors the attention cache and must use identical cells.
+    void state_read_sinfo(
+            llama_io_read_i & io,
+               llama_seq_id   seq_id,
+      llama_state_seq_flags   flags,
+          slot_info_vec_t *   sinfos_out,
+    const slot_info_vec_t *   sinfos_in);
+
     //
     // graph_build API
     //
@@ -267,6 +280,8 @@ public:
     void clone_logical_state_from(const llama_kv_cache & source);
     void set_allocation_group_size(uint32_t group_size, uint32_t stage_groups = 1);
     bool allocation_cell_uses_stage(uint32_t cell) const;
+    int32_t allocation_cell_stage_slot(uint32_t cell) const;
+    const std::vector<int32_t> & get_allocation_stage_slots() const;
     void set_state_remap_group_size(uint32_t group_size);
     const std::vector<std::pair<uint32_t, uint32_t>> & get_state_cell_remap() const;
 
@@ -358,7 +373,7 @@ public:
     bool has_cell_ext() const;
 
     // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
-    // entries with no matching cell are set to LLAMA_TOKEN_NULL
+    // M-RoPE embedding batches are ordered by token index when positions repeat.
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
@@ -366,6 +381,8 @@ private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
     void rebuild_allocation_head(llama_seq_id seq_id);
+    bool reconcile_allocation_stage_slots();
+    std::vector<uint32_t> allocation_live_stage_groups() const;
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -446,6 +463,7 @@ private:
     // independent cursor per logical sequence and select new groups whose
     // stage slot is not occupied by another live frontier.
     std::vector<uint32_t> allocation_seq_heads;
+    std::vector<int32_t> allocation_group_stage_slots;
     uint32_t state_remap_group_size = 1;
     std::vector<std::pair<uint32_t, uint32_t>> state_cell_remap;
     uint32_t tail_write_levels = 0;
@@ -545,18 +563,25 @@ private:
             state_v2_manifest & manifest,
             uint64_t body_payload_size,
             uint64_t tail_payload_size,
-            uint32_t version);
+            uint32_t version,
+            slot_info_vec_t * sinfos_out,
+            const slot_info_vec_t * sinfos_in);
     void materialize_pending_copies();
     std::vector<std::vector<uint32_t>> state_read_body(
-            llama_io_read_i & io, llama_seq_id seq_id, uint32_t n_stream_cur);
-    void state_read_impl(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+            llama_io_read_i & io, llama_seq_id seq_id, uint32_t n_stream_cur,
+            slot_info_vec_t * sinfos_out = nullptr, const slot_info_vec_t * sinfos_in = nullptr);
+    void state_read_impl(
+            llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
+            slot_info_vec_t * sinfos_out = nullptr, const slot_info_vec_t * sinfos_in = nullptr);
     void state_read_tail(
             llama_io_read_i & io,
             llama_seq_id seq_id,
             const std::vector<std::vector<uint32_t>> & restored_cells,
             llama_state_seq_flags flags);
 
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
+    bool state_read_meta(
+            llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo,
+            llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 
@@ -607,6 +632,7 @@ public:
     virtual uint32_t get_n_kv() const;
     virtual llama_kv_cache * get_kv() const;
     virtual const llama_kv_cache::slot_info & current_sinfo() const;
+    virtual const slot_info_vec_t & get_sinfos() const;
 
     virtual ggml_type type_k() const;
     virtual ggml_type type_v() const;

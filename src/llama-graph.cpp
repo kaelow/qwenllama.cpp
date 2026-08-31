@@ -165,13 +165,14 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 
-    // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
-    //       for now, we assume that the hidden state is always provided as an embedding
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
+    // Legacy callers supplied the auxiliary hidden row through embd while also
+    // providing token ids. New callers use embd_nextn so multimodal token
+    // embeddings and target hidden states remain independent.
+    const float * h_data = ubatch->embd_nextn ? ubatch->embd_nextn : ubatch->embd;
+    if (h_data) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        ggml_backend_tensor_set(h, h_data, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 }
 
@@ -180,7 +181,8 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!(params.ubatch.embd_nextn || params.ubatch.embd)) ||
+            (h && h->ne[1] == params.ubatch.n_tokens);
 
     return res;
 }
@@ -1714,6 +1716,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_layer_inp_bundle = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1767,6 +1770,24 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
             }
+        }
+    }
+    {
+        const auto & layers = params.cparams.embeddings_layer_inp_bundle;
+        if (!layers.empty()) {
+            GGML_ASSERT(layers[0] < t_layer_inp.size());
+            GGML_ASSERT(t_layer_inp[layers[0]] != nullptr && "bundled layer input tensor is null");
+
+            t_layer_inp_bundle = t_layer_inp[layers[0]];
+            for (size_t i = 1; i < layers.size(); ++i) {
+                GGML_ASSERT(layers[i] < t_layer_inp.size());
+                GGML_ASSERT(t_layer_inp[layers[i]] != nullptr && "bundled layer input tensor is null");
+                t_layer_inp_bundle = ggml_concat(ctx_compute.get(),
+                        t_layer_inp_bundle, t_layer_inp[layers[i]], 0);
+            }
+            ggml_set_name(t_layer_inp_bundle, "layer_inp_bundle");
+            ggml_build_forward_expand(gf, t_layer_inp_bundle);
+            ggml_set_output(t_layer_inp_bundle);
         }
     }
     for (auto * tensor : t_sampled) {
@@ -3448,6 +3469,71 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+void llm_graph_context::build_attn_store_kv(
+        llm_graph_input_attn_kv * inp,
+                 ggml_tensor * k_cur,
+                 ggml_tensor * v_cur,
+                         int   il) const {
+    const auto * mctx_cur = inp->mctx;
+
+    // MTP draft contexts use ordinary caches. Keep this helper fail-closed if
+    // an unsupported target-only record cache is ever wired to it.
+    GGML_ASSERT(dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) == nullptr);
+
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    auto * k_idxs = inp->get_k_idxs();
+    auto * v_idxs = inp->get_v_idxs();
+
+    if (mctx_cur->has_compact_tail()) {
+        ggml_tensor * k_written = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        ggml_tensor * v_written = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        if (k_written) {
+            ggml_build_forward_expand(gf, k_written);
+        }
+        if (v_written) {
+            ggml_build_forward_expand(gf, v_written);
+        }
+        if (ggml_tensor * written = mctx_cur->cpy_k_tail(ctx0, k_cur, inp->self_tail_idxs, il, k_written)) {
+            ggml_build_forward_expand(gf, written);
+        }
+        if (ggml_tensor * written = mctx_cur->cpy_v_tail(ctx0, v_cur, inp->self_tail_idxs, il, v_written)) {
+            ggml_build_forward_expand(gf, written);
+        }
+        return;
+    }
+
+    if (ggml_tensor * written = mctx_cur->cpy_k_with_tail(ctx0, k_cur, k_idxs, inp->self_tail_idxs, il)) {
+        ggml_build_forward_expand(gf, written);
+    } else {
+        if (ggml_tensor * body = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)) {
+            ggml_build_forward_expand(gf, body);
+        }
+        if (ggml_tensor * tail = mctx_cur->cpy_k_tail(ctx0, k_cur, inp->self_tail_idxs, il)) {
+            ggml_build_forward_expand(gf, tail);
+        }
+    }
+
+    if (ggml_tensor * written = mctx_cur->cpy_v_with_tail(ctx0, v_cur, v_idxs, inp->self_tail_idxs, il)) {
+        ggml_build_forward_expand(gf, written);
+    } else {
+        if (ggml_tensor * body = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il)) {
+            ggml_build_forward_expand(gf, body);
+        }
+        if (ggml_tensor * tail = mctx_cur->cpy_v_tail(ctx0, v_cur, inp->self_tail_idxs, il)) {
+            ggml_build_forward_expand(gf, tail);
+        }
+    }
 }
 
 ggml_tensor * llm_graph_context::build_attn(

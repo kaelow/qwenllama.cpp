@@ -1,4 +1,5 @@
 #include "../tools/server/server-task.h"
+#include "../common/speculative.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -24,10 +25,60 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(server_prompt_reuse_alignment(128) == 128);
     assert(server_prompt_reuse_alignment(192) == 192);
 
-    assert(server_prompt_checkpoint_boundary(795, 132,   1) == 663);
-    assert(server_prompt_checkpoint_boundary(795, 132, 128) == 640);
-    assert(server_prompt_checkpoint_boundary(795,   4, 128) == 768);
-    assert(server_prompt_checkpoint_boundary(3,     4, 128) == 0);
+    server_tokens prompt_795(llama_tokens(795, 1), false);
+    server_tokens prompt_3(llama_tokens(3, 1), false);
+    assert(server_prompt_checkpoint_boundary(prompt_795, 132,   1) == 663);
+    assert(server_prompt_checkpoint_boundary(prompt_795, 132, 128) == 640);
+    assert(server_prompt_checkpoint_boundary(prompt_795,   4, 128) == 768);
+    assert(server_prompt_checkpoint_boundary(prompt_3,     4, 128) == 0);
+
+    // The pi failure had 66,304 logical tokens but a physical checkpoint end
+    // at 65,623. Only the physical next position determines descriptor safety.
+    assert(!server_prompt_checkpoint_position_is_stable(65623, 128));
+    assert( server_prompt_checkpoint_position_is_stable(65535, 128));
+    assert( server_prompt_checkpoint_position_is_stable(65623,   1));
+
+    assert(server_prompt_checkpoint_draft_cap(250, 128, 32, true) == 5);
+    assert(server_prompt_checkpoint_draft_cap(256, 128, 32, true) == 32);
+    assert(server_prompt_checkpoint_draft_cap(250, 128, 32, false) == 32);
+}
+
+static void ngram_checkpoint_misses_back_off_by_actual_rollback_cost() {
+    common_ngram_mod_adaptive_state state;
+    common_ngram_mod_adaptive_begin(state, 8, 32);
+    assert(state.n_max == 16);
+
+    // Growth requires sustained evidence and advances one verifier bucket.
+    common_ngram_mod_adaptive_accept(state, 8, 32, 16, 16, 2, true);
+    assert(state.n_max == 16 && state.n_good == 1);
+    common_ngram_mod_adaptive_accept(state, 8, 32, 16, 16, 2, true);
+    assert(state.n_max == 24 && state.n_good == 0);
+
+    // A half-accepted proposal still restores/replays when rejection exceeds
+    // the native two-token horizon. It must not be rounded back up to 16/24.
+    common_ngram_mod_adaptive_accept(state, 8, 32, 24, 12, 2, true);
+    assert(state.n_max == 8 && state.n_bad == 1 && state.cooldown == 2);
+    assert(!common_ngram_mod_adaptive_should_draft(state, true));
+    assert(state.cooldown == 1);
+    assert(!common_ngram_mod_adaptive_should_draft(state, true));
+    assert(state.cooldown == 0);
+    assert(common_ngram_mod_adaptive_should_draft(state, true));
+
+    // Rejections inside the recurrent snapshot reserve remain cheap/native.
+    common_ngram_mod_adaptive_accept(state, 8, 32, 8, 6, 2, true);
+    assert(state.n_max == 8 && state.n_bad == 1 && state.cooldown == 0);
+
+    // Mirror the observed 32/16 refusal: retry at 16, then apply a cooldown.
+    state.n_max = 32;
+    state.n_bad = 0;
+    common_ngram_mod_adaptive_accept(state, 8, 32, 32, 16, 2, true);
+    assert(state.n_max == 16 && state.n_bad == 1 && state.cooldown == 2);
+
+    // A subsequent zero-accept checkpoint miss backs off harder and yields for
+    // eight opportunities, allowing MTP/ordinary decoding to make progress.
+    state.cooldown = 0;
+    common_ngram_mod_adaptive_accept(state, 8, 32, 16, 0, 2, true);
+    assert(state.n_max == 8 && state.n_bad == 2 && state.cooldown == 8);
 }
 
 static void speculative_tail_reserve_is_decoupled_from_recurrent_snapshots() {
@@ -56,6 +107,23 @@ static server_prompt make_prompt(const llama_tokens & tokens) {
     server_prompt prompt;
     prompt.tokens = server_tokens(tokens, false);
     return prompt;
+}
+
+static void prompt_planner_rejects_logical_only_kvarn_alignment() {
+    server_prompt prompt = make_prompt(llama_tokens(67189, 1));
+    auto & valid = prompt.checkpoints.emplace_back();
+    valid.n_tokens = 65536;
+    valid.pos_min = valid.pos_max = 65535;
+
+    auto & pi_invalid = prompt.checkpoints.emplace_back();
+    pi_invalid.n_tokens = 66304; // token-aligned, but not position-aligned
+    pi_invalid.pos_min = pi_invalid.pos_max = 65623;
+
+    server_tokens requested(llama_tokens(67189, 1), false);
+    const auto reuse = server_prompt_plan_reuse(
+            prompt, requested, 128, 0, false);
+    assert(reuse.reason == SERVER_PROMPT_REUSE_CHECKPOINT);
+    assert(reuse.restorable_tokens == 65536);
 }
 
 static common_memory_seq_rm_result test_seq_rm_suffix(
@@ -156,6 +224,38 @@ static void restore_transaction_validation_failures_are_atomic() {
         };
         assert(!server_prompt_restore_transaction(states[0], states[1], states[2], io));
         assert(prepared >= 1 && prepared <= 3);
+        assert(committed == 0);
+    }
+}
+
+static void restore_transaction_validation_failure_identifies_prepare_leg() {
+    const server_prompt_state_view states[] = {
+        { reinterpret_cast<const uint8_t *>("target"), 6 },
+        { reinterpret_cast<const uint8_t *>("draft"), 5 },
+        { reinterpret_cast<const uint8_t *>("spec"), 4 },
+    };
+    const server_prompt_state_kind kinds[] = {
+        SERVER_PROMPT_STATE_MAIN,
+        SERVER_PROMPT_STATE_DRAFT,
+        SERVER_PROMPT_STATE_SPECULATIVE,
+    };
+
+    for (const auto failed_kind : kinds) {
+        int committed = 0;
+        server_prompt_restore_transaction_io io {
+            /*.restore_target =*/ true,
+            /*.restore_draft =*/ true,
+            /*.restore_speculative =*/ true,
+            /*.prepare =*/ [&](server_prompt_state_kind kind, server_prompt_state_view) {
+                return kind != failed_kind;
+            },
+            /*.commit =*/ [&](server_prompt_state_kind) { ++committed; },
+        };
+        const auto result = server_prompt_restore_transaction_diagnostic(
+                states[0], states[1], states[2], io);
+        assert(!result.success);
+        assert(result.component == failed_kind);
+        assert(result.reason == SERVER_PROMPT_RESTORE_PREPARE_REJECTED);
         assert(committed == 0);
     }
 }
@@ -271,6 +371,18 @@ static void server_planned_removal_preserves_atomic_media_chunks() {
     mtmd::input_chunks chunks(mtmd_test_create_input_chunks());
     server_tokens prompt_tokens(chunks, true);
 
+    // The synthetic image occupies 16 logical cells but advances only four
+    // M-RoPE positions. An aligned boundary inside it must round back to the
+    // preceding complete text prefix, never split the media chunk.
+    assert(prompt_tokens.complete_prefix_size_at_or_before(6) == 5);
+    const int64_t media_boundary = server_prompt_checkpoint_boundary(
+            prompt_tokens, 0, 4);
+    assert(media_boundary > 0);
+    const llama_pos media_boundary_p0 = prompt_tokens.pos_next(media_boundary);
+    assert(media_boundary_p0%4 == 0);
+    assert(prompt_tokens.prefix_size_at_or_before_pos(media_boundary_p0) ==
+            size_t(media_boundary));
+
     const llama_pos requested_p0 = prompt_tokens.pos_next();
     const llama_pos inside_media = 6;
     const llama_pos media_end = prompt_tokens.pos_next(prompt_tokens.size_up_to_pos(inside_media));
@@ -346,8 +458,11 @@ int main() {
     prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp();
     prompt_cache_load_target_success_draft_failure_is_atomic();
     restore_transaction_validation_failures_are_atomic();
+    restore_transaction_validation_failure_identifies_prepare_leg();
     speculative_rollback_checkpoint_boundary();
+    ngram_checkpoint_misses_back_off_by_actual_rollback_cost();
     speculative_tail_reserve_is_decoupled_from_recurrent_snapshots();
+    prompt_planner_rejects_logical_only_kvarn_alignment();
     checkpoint_failed_target_save_cannot_reuse_stale_bytes();
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();
@@ -394,6 +509,7 @@ int main() {
             /*.data =*/ {
                 /*.main =*/ std::vector<uint8_t>(64),
                 /*.drft =*/ std::vector<uint8_t>(32),
+                /*.spec =*/ { },
             },
         };
         assert(state.accounted_size() == 128);

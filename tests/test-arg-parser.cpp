@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <functional>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -98,6 +99,62 @@ static void test(void) {
             std::numeric_limits<int32_t>::max(),
             std::numeric_limits<int32_t>::max(),
             std::numeric_limits<int32_t>::max());
+
+    {
+        common_params_speculative spec;
+        spec.synth_len = 3.4;
+
+        auto assert_invalid = [](const common_params_speculative & value, int32_t n_max) {
+            try {
+                common_speculative_synth_rates_resolve(&value, n_max);
+                assert(false);
+            } catch (const std::invalid_argument &) {
+            }
+        };
+
+        const auto rates = common_speculative_synth_rates_resolve(&spec, 4);
+        assert(rates.size() == 4);
+        assert(std::abs(rates[0] - 0.80581) < 1e-5);
+        assert(std::abs(rates[1] - 0.64933) < 1e-5);
+        assert(std::abs(rates[2] - 0.52323) < 1e-5);
+        assert(std::abs(rates[3] - 0.42163) < 1e-5);
+        assert(std::abs(1.0 + rates[0] + rates[1] + rates[2] + rates[3] - 3.4) < 1e-8);
+
+        spec.synth_len = 1.0;
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == std::vector<double>({0.0, 0.0, 0.0, 0.0}));
+
+        spec.synth_len = 5.0;
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == std::vector<double>({1.0, 1.0, 1.0, 1.0}));
+
+        spec.synth_len = 5.1;
+        assert_invalid(spec, 4);
+
+        spec.synth_len = std::numeric_limits<double>::quiet_NaN();
+        assert_invalid(spec, 4);
+
+        spec.synth_len = 0.0;
+        assert_invalid(spec, 4);
+
+        spec.synth_len = -1.0;
+        spec.synth_rates = {0.8, 0.6, 0.4};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, 0.2};
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == spec.synth_rates);
+
+        spec.synth_rates = {0.8, 0.9, 0.4, 0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, std::numeric_limits<double>::quiet_NaN(), 0.4, 0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, -0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, 0.2};
+        spec.synth_len = 3.0;
+        assert_invalid(spec, 4);
+    }
 
     {
         common_params base;
@@ -616,7 +673,7 @@ static void test(void) {
     assert(false == dflash_parsed);
     assert(dflash_error.find("unknown speculative type: dflash") != std::string::npos);
 
-    for (const std::string & removed : {"copyspec", "suffix", "recycle"}) {
+    for (const std::string removed : {"copyspec", "suffix", "recycle"}) {
         params = common_params();
         argv = {"binary_name", "--spec-type", removed};
         bool parsed = true;
@@ -705,6 +762,26 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
 
     params = common_params();
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-len", "3.4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+        assert(synth_params.speculative.synth_len == 3.4);
+    }
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-rates", "0.8,0.6,0.2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+        assert(synth_params.speculative.synth_rates == std::vector<double>({0.8, 0.6, 0.2}));
+    }
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-len", "3.4x"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-m", "model_file.gguf", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -861,10 +938,59 @@ static void test_single_device_draft_does_not_inherit_target_tensor_split() {
     }
 }
 
+static void test_hip_accelerator_target_cache_independence() {
+    for (const std::vector<std::string> & target_cache : {
+            std::vector<std::string> { "kvarn5", "kvarn6" },
+            std::vector<std::string> { "q6_1", "q5_1" },
+            std::vector<std::string> { "q8_0", "q3_1" },
+        }) {
+        common_params params;
+        std::vector<std::string> argv = {
+            "binary_name", "-m", "target.gguf",
+            "--cache-type-k", target_cache[0],
+            "--cache-type-v", target_cache[1],
+            "--kv-tail-tokens", "128",
+            "--spec-type", "draft-mtp",
+            "--spec-draft-accelerator", "hip",
+            "--spec-draft-accelerator-model", "accelerator.gguf",
+            "--spec-draft-type-k", "q8_0",
+            "--spec-draft-type-v", "q8_0",
+        };
+        std::vector<char *> argv_raw;
+        argv_raw.reserve(argv.size());
+        for (auto & value : argv) {
+            argv_raw.push_back(value.data());
+        }
+        assert(common_params_parse(
+                argv.size(), argv_raw.data(), params, LLAMA_EXAMPLE_SERVER));
+        assert(params.speculative.draft.accelerator == COMMON_SPECULATIVE_DRAFT_ACCELERATOR_HIP);
+        assert(params.speculative.draft.accelerator_model == "accelerator.gguf");
+        assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q8_0);
+        assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q8_0);
+        assert(params.kv_tail_tokens == "128");
+
+        if (target_cache[0] == "kvarn5") {
+            assert(params.cache_kvarn_bits_k == 5);
+            assert(params.cache_kvarn_bits_v == 6);
+        } else {
+            assert(params.cache_kvarn_bits_k == 0);
+            assert(params.cache_kvarn_bits_v == 0);
+            if (target_cache[0] == "q6_1") {
+                assert(params.cache_type_k == GGML_TYPE_Q6_1);
+                assert(params.cache_type_v == GGML_TYPE_Q5_1);
+            } else {
+                assert(params.cache_type_k == GGML_TYPE_Q8_0);
+                assert(params.cache_type_v == GGML_TYPE_Q3_1);
+            }
+        }
+    }
+}
+
 int main(void) {
     try {
         test();
         test_single_device_draft_does_not_inherit_target_tensor_split();
+        test_hip_accelerator_target_cache_independence();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;

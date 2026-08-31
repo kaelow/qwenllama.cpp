@@ -736,6 +736,10 @@ const llama_kv_cache::slot_info & llama_kv_cache_kvarn_context::current_sinfo() 
     return base()->current_sinfo();
 }
 
+const llama_kv_cache_context::slot_info_vec_t & llama_kv_cache_kvarn_context::get_sinfos() const {
+    return base()->get_sinfos();
+}
+
 ggml_type llama_kv_cache_kvarn_context::type_k() const {
     return GGML_TYPE_F16;
 }
@@ -965,8 +969,26 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst, c
                 data[read] = cell;
                 continue;
             }
-            data[read] = metadata->allocation_cell_uses_stage(uint32_t(cell)) ?
-                    llama_kvarn_encode_stage_cell(uint32_t(cell)) : cell;
+            int32_t stage_slot = -1;
+            if (metadata->allocation_cell_uses_stage(uint32_t(cell))) {
+                const auto & sinfo = current_sinfo();
+                if (!sinfo.empty() && !sinfo.stage_slots.empty()) {
+                    for (uint32_t stream = 0; stream < sinfo.n_stream() && stage_slot < 0; ++stream) {
+                        for (size_t i = 0; i < sinfo.idxs[stream].size(); ++i) {
+                            if (sinfo.idxs[stream][i] == uint32_t(cell)) {
+                                stage_slot = int32_t(sinfo.stage_slots[stream][i]);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (stage_slot < 0) {
+                    stage_slot = metadata->allocation_cell_stage_slot(uint32_t(cell));
+                }
+                GGML_ASSERT(stage_slot >= 0);
+            }
+            data[read] = stage_slot >= 0 ?
+                    llama_kvarn_encode_stage_cell(uint32_t(cell), uint32_t(stage_slot)) : cell;
         }
         return;
     }
@@ -1019,6 +1041,17 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const lla
         return;
     }
     base()->set_input_k_idxs(dst, ubatch);
+    if (cache->uses_compact_read_indices()) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        const auto & sinfo = current_sinfo();
+        GGML_ASSERT(sinfo.n_stream() == 1 && !sinfo.stage_slots.empty() &&
+                sinfo.stage_slots[0].size() == ubatch->n_tokens);
+        auto * data = static_cast<int64_t *>(dst->data);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = llama_kvarn_encode_store_cell(
+                    llama_kvarn_decode_cell(data[i]), sinfo.stage_slots[0][i]);
+        }
+    }
 }
 
 void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -1032,6 +1065,17 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const lla
         return;
     }
     base()->set_input_v_idxs(dst, ubatch);
+    if (cache->uses_compact_read_indices()) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        const auto & sinfo = current_sinfo();
+        GGML_ASSERT(sinfo.n_stream() == 1 && !sinfo.stage_slots.empty() &&
+                sinfo.stage_slots[0].size() == ubatch->n_tokens);
+        auto * data = static_cast<int64_t *>(dst->data);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = llama_kvarn_encode_store_cell(
+                    llama_kvarn_decode_cell(data[i]), sinfo.stage_slots[0][i]);
+        }
+    }
 }
 
 void llama_kv_cache_kvarn_context::set_input_tail_idxs(
@@ -1052,6 +1096,17 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, c
         ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(int64_t));
         return;
     }
+    if (cache->uses_compact_read_indices()) {
+        const auto & sinfo = current_sinfo();
+        GGML_ASSERT(sinfo.n_stream() == 1 && !sinfo.stage_slots.empty() &&
+                sinfo.stage_slots[0].size() == ubatch->n_tokens);
+        std::vector<int64_t> data(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = llama_kvarn_encode_store_cell(sinfo.idxs[0][i], sinfo.stage_slots[0][i]);
+        }
+        ggml_backend_tensor_set(dst, data.data(), 0, data.size()*sizeof(int64_t));
+        return;
+    }
     base()->set_input_k_idxs_backend(dst, ubatch);
 }
 
@@ -1062,6 +1117,17 @@ void llama_kv_cache_kvarn_context::set_input_v_idxs_backend(ggml_tensor * dst, c
             data[i] = (int64_t) ubatch->pos[i];
         }
         ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(int64_t));
+        return;
+    }
+    if (cache->uses_compact_read_indices()) {
+        const auto & sinfo = current_sinfo();
+        GGML_ASSERT(sinfo.n_stream() == 1 && !sinfo.stage_slots.empty() &&
+                sinfo.stage_slots[0].size() == ubatch->n_tokens);
+        std::vector<int64_t> data(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = llama_kvarn_encode_store_cell(sinfo.idxs[0][i], sinfo.stage_slots[0][i]);
+        }
+        ggml_backend_tensor_set(dst, data.data(), 0, data.size()*sizeof(int64_t));
         return;
     }
     base()->set_input_v_idxs_backend(dst, ubatch);
@@ -2182,7 +2248,8 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
                 stage_groups,
                 tail_groups,
                 swa,
-                swa ? nullptr : &staged_groups);
+                swa ? nullptr : &staged_groups,
+                swa ? nullptr : &metadata->get_allocation_stage_slots());
     }
     if (selective_stage_cells.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("KVarN selective stage row count overflows uint32_t");
@@ -2323,6 +2390,15 @@ uint32_t llama_kv_cache_kvarn_context::native_rotated_max_query_tokens(int32_t i
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
+}
+
+void llama_kv_cache_kvarn::state_read_sinfo(
+        llama_io_read_i & io,
+           llama_seq_id   seq_id,
+  llama_state_seq_flags   flags,
+llama_kv_cache::slot_info_vec_t * sinfos_out,
+const llama_kv_cache::slot_info_vec_t * sinfos_in) {
     if (has_pending_stream_copies()) {
         throw std::runtime_error("cannot restore KVarN state while a stream copy is pending");
     }
@@ -2338,7 +2414,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     if (self_contained) {
         metadata_prepared->set_state_remap_group_size(KVAR_N_GROUP);
     }
-    metadata_prepared->state_read(io, seq_id, flags);
+    metadata_prepared->state_read_sinfo(io, seq_id, flags, sinfos_out, sinfos_in);
     const auto & state_cell_remap_pairs = metadata_prepared->get_state_cell_remap();
     std::unordered_map<uint32_t, uint32_t> state_cell_remap(
             state_cell_remap_pairs.begin(), state_cell_remap_pairs.end());
@@ -2565,7 +2641,8 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                 stage_groups,
                 tail_groups,
                 swa,
-                swa ? nullptr : &staged_groups);
+                swa ? nullptr : &staged_groups,
+                swa ? nullptr : &metadata_prepared->get_allocation_stage_slots());
         for (const auto & cell : desired) {
             desired_stage_rows.emplace(cell.source_cell, cell.stage_row);
         }

@@ -40,6 +40,9 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    // Qwen MTP prefix catch-up: project and store K/V only. The draft steps
+    // continue to use LLM_GRAPH_TYPE_DECODER_MTP.
+    LLM_GRAPH_TYPE_DECODER_MTP_KV_ONLY,
 };
 
 enum llm_fused_op {
@@ -955,6 +958,8 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.embeddings_layer_inp    == other.cparams.embeddings_layer_inp    &&
+            cparams.embeddings_layer_inp_bundle == other.cparams.embeddings_layer_inp_bundle &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -983,6 +988,7 @@ public:
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+    ggml_tensor * get_layer_inp_bundle() const { return t_layer_inp_bundle; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -1016,6 +1022,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_layer_inp_bundle = nullptr; // [n_embd * n_layers, n_tokens]
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1303,6 +1310,14 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
                     int   il) const;
+
+    // Store projected K/V without constructing Q, attention, output, FFN, or
+    // vocabulary work. This preserves ordinary and exact-tail cache writes.
+    void build_attn_store_kv(
+            llm_graph_input_attn_kv * inp,
+                     ggml_tensor * k_cur,
+                     ggml_tensor * v_cur,
+                             int   il) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

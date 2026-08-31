@@ -128,7 +128,8 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const llm_graph_params & params) const {
-    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP ||
+            params.gtype == LLM_GRAPH_TYPE_DECODER_MTP_KV_ONLY) {
         return std::make_unique<graph_mtp>(*this, params);
     }
     return std::make_unique<graph>(*this, params);
@@ -535,8 +536,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -557,6 +557,27 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
+    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "mtp_Kcur_normed", il);
+
+    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    cb(Vcur, "mtp_Vcur", il);
+
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP_KV_ONLY) {
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Kcur, "mtp_Kcur_rope", il);
+
+        build_attn_store_kv(inp_attn, Kcur, Vcur, il);
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
     cb(Qcur_full, "mtp_Qcur_full", il);
 
@@ -575,15 +596,6 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             ggml_element_size(Qcur_full) * n_embd_head);
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "mtp_gate", il);
-
-    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Kcur, "mtp_Kcur_normed", il);
-
-    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-    cb(Vcur, "mtp_Vcur", il);
 
     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
